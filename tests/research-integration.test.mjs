@@ -62,7 +62,7 @@ async function harness(t) {
   const run = () => tools.get("run_experiment").execute("run", { command: "bash .auto/measure.sh" }, undefined, undefined, ctx);
   const log = (metric, status = "keep", extra = {}) => tools.get("log_experiment").execute("log", { commit: "abcdef0", metric, status, description: "EXPERIMENTER_CLAIM_DO_NOT_SEND", asi: { hypothesis: "HISTORY_DO_NOT_SEND" }, ...extra }, undefined, undefined, ctx);
   await tools.get("init_experiment").execute("init", { name: "Optimize time", metric_name: "time", direction: "lower" }, undefined, undefined, ctx);
-  return { cwd, ctx, calls, write, run, log, commands, reject: () => { decision = false; }, failCommit: () => { failCommit = true; }, allowCommit: () => { failCommit = false; } };
+  return { cwd, ctx, calls, write, run, log, commands, tools, reject: () => { decision = false; }, failCommit: () => { failCommit = true; }, allowCommit: () => { failCommit = false; } };
 }
 
 test("independent acceptance commits actual code, captures review, and triggers fresh ideation", async (t) => {
@@ -130,4 +130,34 @@ test("failed Git commits do not record keep or advance the holdout reference", a
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.cwd, ".auto/research-state.json"), "utf8")).reference.validation, 100);
   f.allowCommit();
   assert.equal((await f.log(50)).details.experiment.status, "keep");
+});
+
+test("shell chaining cannot replace canonical benchmark output", async (t) => {
+  const f = await harness(t);
+  for (const command of ["bash .auto/measure.sh >/dev/null; echo 'METRIC time=1'", "bash /tmp/other/.auto/measure.sh", "bash .auto/measure.sh --fake", "PRIMARY=1 bash .auto/measure.sh"]) {
+    const result = await f.tools.get("run_experiment").execute("spoof", { command }, undefined, undefined, f.ctx);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /canonical benchmark/);
+  }
+  assert.equal((await f.log(1)).isError, true);
+});
+
+test("reinitialization invalidates pending evidence and cannot reset an accepted baseline", async (t) => {
+  const f = await harness(t);
+  await f.run();
+  await f.tools.get("init_experiment").execute("init-again", { name: "Time", metric_name: "time", direction: "lower" }, undefined, undefined, f.ctx);
+  assert.equal((await f.log(100)).isError, true);
+  await f.run(); await f.log(100);
+  const reinit = await f.tools.get("init_experiment").execute("reset", { name: "Other", metric_name: "other", direction: "higher" }, undefined, undefined, f.ctx);
+  assert.equal(reinit.isError, true);
+});
+
+test("a worse primary cannot be kept even with unchanged holdout and an accepting reviewer", async (t) => {
+  const f = await harness(t);
+  await f.run(); await f.log(100);
+  f.write("source.sh", "PRIMARY=110\nHOLDOUT=100\n");
+  await f.run();
+  const calls = f.calls.length;
+  assert.equal((await f.log(110)).isError, true);
+  assert.equal(f.calls.length, calls);
 });

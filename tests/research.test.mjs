@@ -87,6 +87,25 @@ test('persisted holdout reference rejects later regression without invoking the 
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.cwd, '.auto/research-state.json'), 'utf8')).reference, { validation: 100 });
 });
 
+test('regression tolerance cannot accumulate drift beyond the original baseline', async (t) => {
+  const f = fixture(t);
+  const configFile = path.join(f.cwd, '.auto/research.json');
+  const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  config.validationMetrics[0].maxRegressionPercent = 10;
+  fs.writeFileSync(configFile, JSON.stringify(config));
+  fs.unlinkSync(path.join(f.cwd, '.auto/research-state.json'));
+  const session = new ResearchSession(f.cwd, exec);
+  await measure(f, session); await session.review(100, accept); session.consume(true);
+  f.write('source.sh', 'PRIMARY=90\nHOLDOUT=105\n');
+  await measure(f, session); await session.review(90, accept); session.consume(true);
+  f.write('source.sh', 'PRIMARY=80\nHOLDOUT=110.25\n');
+  await measure(f, session);
+  let called = false;
+  const result = await session.review(80, async () => { called = true; return accept(); });
+  assert.equal(result.review.accept, false);
+  assert.equal(called, false);
+});
+
 test('invalid or unavailable evaluator and outstanding validation fail closed', async (t) => {
   const responses = [async () => 'not json', async () => { throw new Error('Provider unavailable'); }, async () => JSON.stringify({ accept: true, reason: 'Needs another check.', overfittingRisks: [], requiredValidation: ['Check unseen workloads.'] }), async () => JSON.stringify({ accept: 'yes', reason: 'Invalid decision.', overfittingRisks: [], requiredValidation: [] })];
   for (const [index, response] of responses.entries()) {
@@ -171,4 +190,85 @@ test('holdout failure and code mutation during validation block acceptance', asy
       }
     });
   }
+});
+
+function resetConfig(f, updates) {
+  const file = path.join(f.cwd, '.auto/research.json');
+  const config = JSON.parse(fs.readFileSync(file, 'utf8'));
+  f.write('.auto/research.json', JSON.stringify({ ...config, ...updates }));
+  fs.unlinkSync(path.join(f.cwd, '.auto/research-state.json'));
+  return new ResearchSession(f.cwd, exec);
+}
+
+test('model requests time out even when the provider ignores cancellation', async (t) => {
+  const f = fixture(t);
+  const session = resetConfig(f, { timeoutSeconds: 1 });
+  await measure(f, session);
+  const started = Date.now();
+  // Keep Node alive because AbortSignal.timeout uses an unreferenced timer.
+  const keepAlive = setInterval(() => {}, 100);
+  try {
+    const result = await session.review(100, async () => new Promise(() => {}));
+    assert.equal(result.review.accept, false);
+    assert.match(result.review.reason, /cancelled or timed out/);
+    assert.ok(Date.now() - started < 5000, 'Provider must not block beyond the configured deadline.');
+    assert.throws(() => session.consume(true), /Missing independent acceptance/);
+  } finally {
+    clearInterval(keepAlive);
+  }
+});
+
+test('stopping a session during a model request prevents approval', async (t) => {
+  const f = fixture(t);
+  await measure(f);
+  let entered;
+  const requestStarted = new Promise(resolve => { entered = resolve; });
+  let modelSignal;
+  const pending = f.session.review(100, async (_model, _system, _data, signal) => {
+    modelSignal = signal;
+    entered();
+    return new Promise(() => {});
+  });
+  await requestStarted;
+  f.session.cancel();
+  await assert.rejects(pending, /Research session was stopped/);
+  assert.equal(modelSignal.aborted, true);
+  assert.throws(() => f.session.consume(true), /Research session was stopped/);
+  assert.equal(fs.existsSync(path.join(f.cwd, '.auto/reviews.jsonl')), false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.cwd, '.auto/research-state.json'), 'utf8')).reference, null);
+});
+
+test('evaluation helpers are frozen and full evaluation source reaches only the reviewer', async (t) => {
+  const f = fixture(t);
+  const marker = 'HOLDOUT_SOURCE_SENTINEL';
+  f.write('.auto/helper.sh', `# ${marker}\nprintf "helper"\n`);
+  const session = resetConfig(f, { evaluationFiles: ['.auto/helper.sh'] });
+  await measure(f, session);
+  let reviewedData;
+  const result = await session.review(100, async (_model, _system, data) => {
+    reviewedData = data;
+    return accept();
+  });
+  assert.equal(result.review.accept, true);
+  for (const file of ['.auto/helper.sh', '.auto/holdout.sh', '.auto/measure.sh']) {
+    assert.equal(reviewedData.evaluationSource[file], fs.readFileSync(path.join(f.cwd, file), 'utf8'));
+  }
+  await session.ideate(async (_model, _system, data) => {
+    assert.equal(Object.hasOwn(data, 'evaluationSource'), false);
+    assert.equal(JSON.stringify(data).includes(marker), false);
+    return JSON.stringify({ ideas: [{ hypothesis: 'Reduce comparisons.', change: 'Use a hash set.', mechanism: 'Track prior values.', validation: 'Check diverse arrays.' }] });
+  });
+  f.write('.auto/helper.sh', '# changed protected evaluation helper\n');
+  await assert.rejects(session.review(100, accept), /Protected research config or evaluation script changed/);
+  assert.throws(() => new ResearchSession(f.cwd, exec), /Research contract changed/);
+});
+
+test('oversized evaluator output is rejected before parsing or acceptance', async (t) => {
+  const f = fixture(t);
+  await measure(f);
+  const response = JSON.stringify({ accept: true, reason: 'Accepted.', overfittingRisks: [], requiredValidation: [], padding: 'x'.repeat(33 * 1024) });
+  const result = await f.session.review(100, async () => response);
+  assert.equal(result.review.accept, false);
+  assert.match(result.review.reason, /Model response exceeds 32 KiB/);
+  assert.throws(() => f.session.consume(true), /Missing independent acceptance/);
 });

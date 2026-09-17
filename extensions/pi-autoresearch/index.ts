@@ -1573,6 +1573,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         "\nThe checks execution time does NOT affect the primary metric.";
     }
 
+    if (runtime.research || fs.existsSync(path.join(workDir, ".auto/research.json"))) {
+      extra += "\n\nIndependent research review is active. Treat a primary improvement as a candidate, not automatic acceptance. The tools run independent holdout validation and a separate reasoning model before keep. Do not modify research.json, evaluation scripts, evaluation helper files, or research-state.json. Use the canonical benchmark command. Fresh idea agents populate .auto/ideas.md automatically; compare their proposals with prior attempts before choosing.";
+    }
+
     if (hasIdeas) {
       extra += `\n\n💡 Ideas backlog exists at ${ideasPath} — check it for promising experiment paths. Prune stale entries.`;
     }
@@ -1603,6 +1607,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
+
+      try {
+        const research = getResearch(ctx);
+        if (research && state.results.length > 0) throw new Error("Independent research already has a baseline. Start a new session explicitly to change the optimization target.");
+        research?.consume(false);
+      } catch (error) {
+        return { content: [{ type: "text", text: `Research initialization blocked: ${error instanceof Error ? error.message : String(error)}` }], details: {}, isError: true };
+      }
 
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
@@ -1759,6 +1771,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Guard: if the benchmark script exists, only allow running it
       const autoresearchShPath = autoresearchScriptPath(workDir);
       const benchmarkScriptRel = path.relative(workDir, autoresearchShPath) || path.basename(autoresearchShPath);
+      if (research && (!fs.existsSync(autoresearchShPath) || ![
+        `bash ${benchmarkScriptRel}`, `bash ./${benchmarkScriptRel}`, `./${benchmarkScriptRel}`,
+        `bash ${autoresearchShPath}`, autoresearchShPath,
+      ].includes(params.command.trim()))) {
+        return { content: [{ type: "text", text: `Independent research must run the canonical benchmark without arguments or shell operators. Use: bash ${benchmarkScriptRel}` }], details: {}, isError: true };
+      }
       if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
         return {
           content: [{
@@ -1799,7 +1817,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }>((resolve, reject) => {
         let processTimedOut = false;
 
-        const child = spawn("bash", ["-c", params.command], {
+        const child = spawn("bash", research ? [autoresearchShPath] : ["-c", params.command], {
           cwd: workDir,
           detached: true,
           stdio: ["ignore", "pipe", "pipe"],
@@ -2016,7 +2034,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const parsedPrimary = parsedMetricMap.get(state.metricName) ?? null;
 
       const researchEvidence = research && researchSnapshot
-        ? await research.measure(researchSnapshot, state.metricName, parsedPrimary, passed, output, signal)
+        ? await research.measure(researchSnapshot, state.metricName, parsedPrimary, passed, output, signal, actualTotalBytes)
         : undefined;
 
       const details: RunDetails = {
@@ -2318,7 +2336,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       try {
         research = getResearch(ctx);
         if (research && params.status === "keep") {
-          const result = await research.review(params.metric, researchModelCall(ctx), _signal);
+          const reference = findBestMetric(state.results, state.currentSegment, state.bestDirection);
+          if (reference !== null && !isBetter(params.metric, reference, state.bestDirection)) {
+            throw new Error("Primary metric did not improve over the best accepted measurement; log as discard");
+          }
+          const result = await research.review(params.metric, researchModelCall(ctx), _signal, { name: state.metricName, direction: state.bestDirection, reference });
           reviewNote = `Independent review: ${result.review.accept ? "accepted" : "rejected"} — ${result.review.reason}`;
           params = {
             ...params,
@@ -2458,6 +2480,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             const addErr = (addResult.stdout + addResult.stderr).trim();
             throw new Error(`git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`);
           }
+          await research?.assertReviewedSnapshot(_signal);
 
           const diffResult = await pi.exec("git", ["diff", "--cached", "--quiet"], execOpts);
           if (diffResult.code === 0) {
@@ -2518,10 +2541,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             ${research ? "git restore --source=HEAD --staged --worktree --" : "git checkout --"} . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
             git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
           `;
-          await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
+          const revertResult = await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
+          if (revertResult.code !== 0 || revertResult.killed) throw new Error("Git failed to restore the rejected candidate");
           text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
         } catch (e) {
           text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+          if (research) {
+            recordAutoresearchActivation(workDir, false);
+            setAutoresearchMode(ctx, false);
+            ctx.abort();
+          }
         }
       }
 
