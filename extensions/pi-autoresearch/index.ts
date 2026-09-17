@@ -53,6 +53,7 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts, SHORTCUT_ACTIONS } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import { ResearchSession, researchModelCall, type Snapshot } from "./research.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -176,6 +177,7 @@ interface LogDetails {
 }
 
 interface AutoresearchRuntime {
+  research?: ResearchSession;
   autoresearchMode: boolean;
   experimentsThisSession: number;
   autoResumeTurns: number;
@@ -1089,6 +1091,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
 
+  const getResearch = (ctx: ExtensionContext): ResearchSession | undefined => {
+    const runtime = getRuntime(ctx);
+    const workDir = resolveWorkDir(ctx.cwd);
+    if (!runtime.research && !fs.existsSync(path.join(workDir, ".auto/research.json"))) return undefined;
+    const research = runtime.research ?? new ResearchSession(workDir, (command, args, options) => pi.exec(command, args, options));
+    if (research.cwd !== workDir) throw new Error("Research working directory changed during the session");
+    if (ctx.model && research.config.reviewModel === `${ctx.model.provider}/${ctx.model.id}`) {
+      throw new Error("reviewModel must differ from the experimenter model");
+    }
+    runtime.research = research;
+    return research;
+  };
+
   // Registering through this gates the tool, so a new one can't slip in ungated.
   const gatedToolNames = new Set<string>();
   const registerGatedTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
@@ -1098,6 +1113,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   // The one place mode flips: gated tools follow the flag, never drifting from it.
   const setAutoresearchMode = (ctx: ExtensionContext, enabled: boolean): void => {
+    if (!enabled) {
+      getRuntime(ctx).research?.cancel();
+      getRuntime(ctx).research = undefined;
+    }
     getRuntime(ctx).autoresearchMode = enabled;
     const activeTools = new Set(pi.getActiveTools()); // setActiveTools replaces the whole set
     for (const tool of gatedToolNames) {
@@ -1286,13 +1305,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|export|dashboard|<text>]",
+      "Usage: /autoresearch [off|clear|export|dashboard|ideas|<text>]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
       "clear deletes the session log (.auto/log.jsonl) and turns autoresearch mode off.",
       "export opens a local live dashboard for the session log in your browser.",
       "dashboard opens the fullscreen dashboard overlay in the terminal.",
+      "ideas asks independent reasoning agents for fresh experiment candidates.",
 
       "",
       "Examples:",
@@ -1310,6 +1330,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     cancelPendingResume(runtime);
     runtime.lastRunChecks = null;
+    runtime.research?.consume(false);
     runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
     runtime.experimentsThisSession = 0;
@@ -1713,6 +1734,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       const workDir = resolveWorkDir(ctx.cwd);
 
+      let research: ResearchSession | undefined;
+      let researchSnapshot: Snapshot | undefined;
+      try {
+        research = getResearch(ctx);
+        researchSnapshot = await research?.begin(signal);
+      } catch (error) {
+        return { content: [{ type: "text", text: `Research measurement blocked: ${error instanceof Error ? error.message : String(error)}` }], details: {}, isError: true };
+      }
+
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
         const segCount = currentResults(state.results, state.currentSegment).length;
@@ -1985,6 +2015,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         : null;
       const parsedPrimary = parsedMetricMap.get(state.metricName) ?? null;
 
+      const researchEvidence = research && researchSnapshot
+        ? await research.measure(researchSnapshot, state.metricName, parsedPrimary, passed, output, signal)
+        : undefined;
+
       const details: RunDetails = {
         command: params.command,
         exitCode,
@@ -2005,6 +2039,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Build LLM response
       let text = "";
+      if (researchEvidence) {
+        text += researchEvidence.validationPassed
+          ? `Independent holdout passed: ${JSON.stringify(researchEvidence.validation)}. A separate model must approve keep.\n`
+          : `Independent holdout failed: ${researchEvidence.failure}. This candidate cannot be kept.\n`;
+      }
       if (details.timedOut) {
         text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s\n`;
       } else if (!benchmarkPassed) {
@@ -2274,6 +2313,28 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      let research: ResearchSession | undefined;
+      let reviewNote = "";
+      try {
+        research = getResearch(ctx);
+        if (research && params.status === "keep") {
+          const result = await research.review(params.metric, researchModelCall(ctx), _signal);
+          reviewNote = `Independent review: ${result.review.accept ? "accepted" : "rejected"} — ${result.review.reason}`;
+          params = {
+            ...params,
+            status: result.review.accept ? "keep" : "discard",
+            asi: {
+              ...params.asi,
+              independent_review: { model: research.config.reviewModel, evidence_id: result.evidence.id, fingerprint: result.evidence.snapshot.fingerprint, ...result.review },
+              ...(!result.review.accept ? { rollback_reason: result.review.reason } : {}),
+            },
+          };
+        }
+      } catch (error) {
+        return { content: [{ type: "text", text: `Research acceptance blocked: ${error instanceof Error ? error.message : String(error)}` }], details: {}, isError: true };
+      }
+
+      const previousSecondaryMetrics = [...state.secondaryMetrics];
       // ASI: agent-supplied free-form diagnostics
       const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
         ? params.asi as ASI
@@ -2317,6 +2378,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Build response text
       const segmentCount = currentResults(state.results, state.currentSegment).length;
       let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
+      if (reviewNote) text += `\n${reviewNote}`;
 
       if (state.bestMetric !== null) {
         text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
@@ -2381,6 +2443,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Auto-commit only on keep — discards/crashes get reverted anyway
       if (params.status === "keep") {
         try {
+          await research?.assertReviewedSnapshot(_signal);
           const resultData: Record<string, unknown> = {
             status: params.status,
             [state.metricName || "metric"]: params.metric,
@@ -2416,10 +2479,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
                 // Keep the original commit hash if rev-parse fails
               }
             } else {
+              if (research) throw new Error(`Git commit failed (exit ${gitResult.code})`);
               text += `\n⚠️ Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
             }
           }
         } catch (e) {
+          if (research) {
+            state.results.pop();
+            runtime.experimentsThisSession--;
+            state.secondaryMetrics = previousSecondaryMetrics;
+            state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
+            state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+            return { content: [{ type: "text", text: `Research commit blocked: ${e instanceof Error ? e.message : String(e)}` }], details: {}, isError: true };
+          }
           text += `\n⚠️ Git commit error: ${e instanceof Error ? e.message : String(e)}`;
         }
       }
@@ -2443,7 +2515,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (params.status !== "keep") {
         try {
           const revertScript = `
-            git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+            ${research ? "git restore --source=HEAD --staged --worktree --" : "git checkout --"} . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
             git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
           `;
           await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
@@ -2452,6 +2524,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
         }
       }
+
+      research?.consume(params.status === "keep");
 
       const afterSteer = await fireHook({
         event: "after",
@@ -2473,6 +2547,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         setAutoresearchMode(ctx, false);
         ctx.abort();
       } else if (runtime.autoresearchMode) {
+        if (research && research.shouldIdeate(segmentCount, countConsecutiveDiscardOrCrashResults(state))) {
+          try {
+            text += `\n${await research.ideate(researchModelCall(ctx), _signal)}`;
+          } catch (error) {
+            text += `\nIndependent ideation unavailable: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
         text += "\n\nBefore choosing the next experiment, consider whether this result or discovery invalidates a previous discard's rollback reason. If so, name what changed and weigh a targeted retry against other candidates. Otherwise, move on. Don't revive a discarded idea without a changed assumption. Verification reruns to resolve measurement noise are separate.";
         const beforeSteer = await fireHook({
           event: "before",
@@ -3039,6 +3120,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (command === "dashboard") {
         await openFullscreenDashboard(ctx);
+        return;
+      }
+
+      if (command === "ideas") {
+        try {
+          const research = getResearch(ctx);
+          if (!research) throw new Error("Configure .auto/research.json first");
+          ctx.ui.notify("Independent idea agents are working", "info");
+          ctx.ui.notify(await research.ideate(researchModelCall(ctx)), "info");
+        } catch (error) {
+          ctx.ui.notify(`Independent ideation failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        }
         return;
       }
 
