@@ -15,7 +15,7 @@ function exec(command, args, options) {
   });
 }
 
-async function harness(t) {
+async function harness(t, maxIterations = 10) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-research-integration-"));
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   fs.mkdirSync(path.join(cwd, ".auto"));
@@ -24,7 +24,7 @@ async function harness(t) {
   write("source.sh", "PRIMARY=100\nHOLDOUT=100\n");
   write(".auto/measure.sh", '. ./source.sh\nprintf "METRIC time=%s\\n" "$PRIMARY"\n');
   write(".auto/holdout.sh", '. ./source.sh\nprintf "METRIC validation=%s\\n" "$HOLDOUT"\n');
-  write(".auto/config.json", '{"maxIterations":10}');
+  write(".auto/config.json", JSON.stringify({ maxIterations }));
   write(".auto/research.json", JSON.stringify({ objective: "Improve generic execution time.", sourceFiles: ["source.sh"], reviewModel: "fake/reviewer", ideaModels: ["fake/ideas"], validationMetrics: [{ name: "validation", direction: "lower" }], repetitions: 1 }));
   for (const args of [["init", "-q"], ["config", "user.email", "test@example.invalid"], ["config", "user.name", "Research Test"], ["add", "."], ["commit", "-qm", "Baseline"]]) {
     assert.equal((await exec("git", args, { cwd })).code, 0);
@@ -35,6 +35,7 @@ async function harness(t) {
   let active = [];
   let decision = true;
   let failCommit = false;
+  let abortCount = 0;
   const ctx = {
     cwd, hasUI: false, mode: "rpc", isIdle: () => true, hasPendingMessages: () => false,
     model: { provider: "fake", id: "experimenter" },
@@ -48,7 +49,7 @@ async function harness(t) {
         return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify(response) }] };
       },
     },
-    abort() {}, sessionManager: { getSessionId: () => cwd, getBranch: () => [] },
+    abort() { abortCount++; }, sessionManager: { getSessionId: () => cwd, getBranch: () => [] },
     ui: { setWidget() {}, notify() {} },
   };
   autoresearch({
@@ -62,7 +63,7 @@ async function harness(t) {
   const run = () => tools.get("run_experiment").execute("run", { command: "bash .auto/measure.sh" }, undefined, undefined, ctx);
   const log = (metric, status = "keep", extra = {}) => tools.get("log_experiment").execute("log", { commit: "abcdef0", metric, status, description: "EXPERIMENTER_CLAIM_DO_NOT_SEND", asi: { hypothesis: "HISTORY_DO_NOT_SEND" }, ...extra }, undefined, undefined, ctx);
   await tools.get("init_experiment").execute("init", { name: "Optimize time", metric_name: "time", direction: "lower" }, undefined, undefined, ctx);
-  return { cwd, ctx, calls, write, run, log, commands, tools, reject: () => { decision = false; }, failCommit: () => { failCommit = true; }, allowCommit: () => { failCommit = false; } };
+  return { cwd, ctx, calls, write, run, log, commands, tools, abortCount: () => abortCount, activeTools: () => active, reject: () => { decision = false; }, failCommit: () => { failCommit = true; }, allowCommit: () => { failCommit = false; } };
 }
 
 test("independent acceptance commits actual code, captures review, and triggers fresh ideation", async (t) => {
@@ -160,4 +161,16 @@ test("a worse primary cannot be kept even with unchanged holdout and an acceptin
   const calls = f.calls.length;
   assert.equal((await f.log(110)).isError, true);
   assert.equal(f.calls.length, calls);
+});
+
+test("iteration limit returns the accepted result and disables tools without aborting the turn", async (t) => {
+  const f = await harness(t, 2);
+  await f.run(); await f.log(100);
+  f.write("source.sh", "PRIMARY=50\nHOLDOUT=50\n");
+  await f.run();
+  const result = await f.log(50);
+  assert.equal(result.details.experiment.status, "keep");
+  assert.match(result.content[0].text, /Maximum experiments reached/);
+  assert.equal(f.abortCount(), 0);
+  assert.equal(f.activeTools().includes("run_experiment"), false);
 });

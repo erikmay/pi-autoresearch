@@ -2574,7 +2574,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         recordAutoresearchActivation(workDir, false);
         setAutoresearchMode(ctx, false);
-        ctx.abort();
+        if (!research) ctx.abort();
       } else if (runtime.autoresearchMode) {
         if (research && research.shouldIdeate(segmentCount, countConsecutiveDiscardOrCrashResults(state))) {
           try {

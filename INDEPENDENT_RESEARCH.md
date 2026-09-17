@@ -80,3 +80,7 @@ bun examples/independent-research/validate.ts
 It checks a correct baseline, fresh intelligent ideation, a benchmark shortcut that passes the limited holdout but fails independent review, a deterministic validation regression, metric spoofing, edits after measurement, and a general algorithm improvement that gets committed. It uses operation counts to make acceptance boundaries deterministic; those counts are not wall-clock speed measurements.
 
 Override models with `RESEARCH_EXPERIMENTER`, `RESEARCH_REVIEWER`, and the comma-separated `RESEARCH_IDEA_MODELS`. The live example uses the installed current Pi SDK. Automated tests use temporary Git repositories and deterministic model responses for failure cases.
+
+For a complete interactive agent loop, run `bun examples/independent-research/validate.ts --prepare-agent`. Start Pi in the printed directory with this extension loaded, then run `/autoresearch optimize generic duplicate counting`. Pi establishes the baseline, chooses an independently generated idea, implements it, and requests acceptance. The two-experiment limit lets it report the final result without an abort error.
+
+After the loop, run `bun examples/independent-research/final-evaluation.ts <example-directory>`. This checks new input distributions and reports baseline/candidate wall-clock medians across nine alternating-order measurements. These final cases are not sent back to the optimization loop.

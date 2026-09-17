@@ -89,6 +89,10 @@ write(".auto/research.json", JSON.stringify({
   validationMetrics: [{ name: "holdout_operations", direction: "lower", maxRegressionPercent: 0 }],
   repetitions: 3, ideaInterval: 100, stagnationThreshold: 100, timeoutSeconds: 300,
 }, null, 2));
+if (process.argv.includes("--prepare-agent")) {
+  write(".auto/config.json", JSON.stringify({ maxIterations: 2 }));
+  write(".auto/prompt.md", "# Generic duplicate counting\n\nObjective: reduce generic duplicate-counting work for arbitrary arrays of finite numbers. Keep the operation counter honest. No benchmark special cases.\nPrimary metric: operations, lower is better.\nRun: bash .auto/measure.sh\nScope: duplicates.mjs only. Evaluation and configuration files are off limits.\nEstablish the baseline first. Read .auto/ideas.md after baseline, choose the strongest general proposal, implement it, measure it, and request keep. The two-experiment limit ends this example.\n");
+}
 
 async function exec(command: string, args: string[], options: any) {
   return new Promise<any>((resolve, reject) => {
@@ -110,6 +114,11 @@ await git("config", "user.name", "Independent Research Example");
 await git("config", "user.email", "example@invalid.local");
 await git("add", ".");
 await git("commit", "-qm", "Example baseline");
+if (process.argv.includes("--prepare-agent")) {
+  console.log(`PREPARED ${cwd}`);
+  console.log("Start Pi in this directory with the local extension, then run /autoresearch optimize generic duplicate counting.");
+  process.exit(0);
+}
 const tools = new Map<string, any>(), commands = new Map<string, any>(), handlers = new Map<string, any>();
 let activeTools: string[] = [];
 autoresearchExtension({
