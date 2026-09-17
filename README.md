@@ -21,7 +21,7 @@ Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). W
 
 ## Quick start
 
-For an outside advisor that uses measured results to suggest useful experiments or stop an exhausted search, see [Research advisor](INDEPENDENT_RESEARCH.md). Acceptance uses measured improvements and correctness checks. Approach names track prior ideas without blocking useful variants.
+For an outside advisor that uses measured results to suggest useful experiments or stop an exhausted search, see [Research advisor](INDEPENDENT_RESEARCH.md). Approach names track prior ideas without blocking useful variants.
 
 ```bash
 pi install npm:pi-autoresearch
