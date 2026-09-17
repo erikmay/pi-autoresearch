@@ -64,3 +64,18 @@ Nine alternating-order timing measurements produced these local medians:
 These measurements demonstrate the example's general improvement on new inputs. They are local microbenchmarks, not a performance guarantee for other projects. Independent review also cannot prove generalization for arbitrary future workloads; retain separate final validation for each real optimization target.
 
 Reproduce with `validate.ts`, or prepare an interactive loop with `validate.ts --prepare-agent`. Run `final-evaluation.ts <completed-example-directory>` only after the optimization loop finishes.
+
+## Live loop with approaches and the outside advisor (2026-09-17)
+
+A real Pi agent (`openai-codex/gpt-5.6-sol`) ran the prepared example in a Herdr tab with the extension and its skills loaded, no iteration cap, and `approachBudget: 2`. Consultant: `openai-codex/gpt-6-astra`.
+
+| Run | Approach | Result |
+| --- | --- | --- |
+| 1 | baseline | Kept without a model review; holdout reference established |
+| 2 | hash-set-membership | Reviewer accepted; committed (79,800 → 400 operations) |
+| 3 | sort-count-runs | Discarded (2,287 operations) |
+| 4 | radix-number-keys | Discarded (7,199 operations) |
+
+Astra was consulted three times in total: one review and two advisor calls. The first advisor call after the baseline returned three non-overlapping approaches. The second, after two failures in a row, returned `stop` because exact duplicate counting must examine every element. The extension ended the loop and the agent reported the accepted result.
+
+Artifacts: `/var/folders/56/6f72k6k90_71wwhk5vpw9wvw0000gn/T/pi-independent-live-6ZtTto/.auto/`. The unit and integration test files were adapted to the new API but not re-run in this session.

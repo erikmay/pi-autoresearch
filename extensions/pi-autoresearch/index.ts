@@ -182,6 +182,8 @@ interface AutoresearchRuntime {
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
+  /** Approach named by the last run_experiment in independent research mode. */
+  lastRunApproach: string | null;
   lastRunDuration: number | null;
   runningExperiment: { startedAt: number; command: string } | null;
   state: ExperimentState;
@@ -209,6 +211,12 @@ const RunParams = Type.Object({
     Type.Number({
       description:
         "Kill .auto/checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
+    })
+  ),
+  approach: Type.Optional(
+    Type.String({
+      description:
+        "Independent research only: kebab-case name of the approach this experiment belongs to (e.g. 'field-order'). Use 'baseline' for the unchanged baseline. Variants of one idea share one name. A closed approach cannot be run again.",
     })
   ),
 });
@@ -731,6 +739,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     experimentsThisSession: 0,
     autoResumeTurns: 0,
     lastRunChecks: null,
+    lastRunApproach: null,
     lastRunDuration: null,
     runningExperiment: null,
     state: createExperimentState(),
@@ -1096,12 +1105,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const workDir = resolveWorkDir(ctx.cwd);
     if (!runtime.research && !fs.existsSync(path.join(workDir, ".auto/research.json"))) return undefined;
     const research = runtime.research ?? new ResearchSession(workDir, (command, args, options) => pi.exec(command, args, options));
-    if ([research.config.reviewModel, ...research.config.ideaModels].some((model) => model !== CONSULTANT_MODEL)) {
-      throw new Error(`External consultants must use ${CONSULTANT_MODEL}`);
-    }
     if (research.cwd !== workDir) throw new Error("Research working directory changed during the session");
-    if (ctx.model && research.config.reviewModel === `${ctx.model.provider}/${ctx.model.id}`) {
-      throw new Error("reviewModel must differ from the experimenter model");
+    if (ctx.model && CONSULTANT_MODEL === `${ctx.model.provider}/${ctx.model.id}`) {
+      throw new Error(`The experimenter model must differ from the consultant model ${CONSULTANT_MODEL}`);
     }
     runtime.research = research;
     return research;
@@ -1333,6 +1339,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     cancelPendingResume(runtime);
     runtime.lastRunChecks = null;
+    runtime.lastRunApproach = null;
     runtime.research?.consume(false);
     runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
@@ -1577,7 +1584,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
 
     if (runtime.research || fs.existsSync(path.join(workDir, ".auto/research.json"))) {
-      extra += "\n\nIndependent research review is active. Treat a primary improvement as a candidate, not automatic acceptance. The tools run independent holdout validation and a separate reasoning model before keep. Do not modify research.json, evaluation scripts, evaluation helper files, or research-state.json. Use the canonical benchmark command. Fresh idea agents populate .auto/ideas.md automatically; compare their proposals with prior attempts before choosing.";
+      extra += "\n\nIndependent research review is active. Treat a primary improvement as a candidate, not automatic acceptance. The tools run independent holdout validation and a separate reasoning model before keep. Do not modify research.json, evaluation scripts, evaluation helper files, or research-state.json. Use the canonical benchmark command." +
+        "\nEvery run_experiment needs an approach name ('baseline' for the unchanged baseline). Variants of one idea share one name. An approach closes after a fixed number of failed attempts in a row; then it cannot be run again and an outside advisor appends new approaches to .auto/ideas.md. Pick an open approach from that file. Do not rename an exhausted idea to keep working on it.";
     }
 
     if (hasIdeas) {
@@ -1731,7 +1739,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
       "After run_experiment, always call log_experiment to record the result.",
       "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
-
+      "When .auto/research.json exists, pass approach: a short kebab-case name for the idea family this experiment belongs to. Closed approaches are rejected before the benchmark runs.",
     ],
     parameters: RunParams,
 
@@ -1753,6 +1761,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let researchSnapshot: Snapshot | undefined;
       try {
         research = getResearch(ctx);
+        runtime.lastRunApproach = research ? research.assertApproachOpen(params.approach) : null;
         researchSnapshot = await research?.begin(signal);
       } catch (error) {
         return { content: [{ type: "text", text: `Research measurement blocked: ${error instanceof Error ? error.message : String(error)}` }], details: {}, isError: true };
@@ -2351,7 +2360,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             status: result.review.accept ? "keep" : "discard",
             asi: {
               ...params.asi,
-              independent_review: { model: research.config.reviewModel, evidence_id: result.evidence.id, fingerprint: result.evidence.snapshot.fingerprint, ...result.review },
+              independent_review: { model: CONSULTANT_MODEL, evidence_id: result.evidence.id, fingerprint: result.evidence.snapshot.fingerprint, ...result.review },
               ...(!result.review.accept ? { rollback_reason: result.review.reason } : {}),
             },
           };
@@ -2361,9 +2370,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const previousSecondaryMetrics = [...state.secondaryMetrics];
+      const approach = research ? runtime.lastRunApproach : null;
       // ASI: agent-supplied free-form diagnostics
-      const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
-        ? params.asi as ASI
+      const mergedASI = (params.asi && Object.keys(params.asi).length > 0) || approach
+        ? { ...(approach ? { approach } : {}), ...params.asi } as ASI
         : undefined;
 
       const experiment: ExperimentResult = {
@@ -2559,6 +2569,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       research?.consume(params.status === "keep");
+      const approachClosed = research && approach ? research.recordApproach(approach, params.status === "keep") : false;
+      if (approachClosed) text += `\n\nApproach "${approach}" is closed after ${research!.config.approachBudget} failed attempts in a row. Do not try further variants of it.`;
 
       const afterSteer = await fireHook({
         event: "after",
@@ -2571,6 +2583,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const wallClockSeconds = runtime.lastRunDuration;
       runtime.runningExperiment = null;
       runtime.lastRunChecks = null;
+      runtime.lastRunApproach = null;
       runtime.lastRunDuration = null;
 
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
@@ -2580,9 +2593,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         setAutoresearchMode(ctx, false);
         if (!research) ctx.abort();
       } else if (runtime.autoresearchMode) {
-        if (research && research.shouldIdeate(segmentCount, countConsecutiveDiscardOrCrashResults(state))) {
+        // Ask outside after the baseline, when an approach is exhausted, and after every budget-sized
+        // run of failures across approaches. The advisor proposes new approaches or stops the loop.
+        const failureStreak = countConsecutiveDiscardOrCrashResults(state);
+        if (research && (segmentCount === 1 || approachClosed || (failureStreak > 0 && failureStreak % research.config.approachBudget === 0))) {
           try {
-            text += `\n${await research.ideate(researchModelCall(ctx), _signal)}`;
+            const advice = await research.ideate(researchModelCall(ctx), _signal);
+            text += `\n${advice.text}`;
+            if (advice.stop) {
+              text += "\n\n🛑 STOP the experiment loop now and report the accepted result.";
+              recordAutoresearchActivation(workDir, false);
+              setAutoresearchMode(ctx, false);
+            }
           } catch (error) {
             text += `\nIndependent ideation unavailable: ${error instanceof Error ? error.message : String(error)}`;
           }
@@ -3160,8 +3182,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         try {
           const research = getResearch(ctx);
           if (!research) throw new Error("Configure .auto/research.json first");
-          ctx.ui.notify("Independent idea agents are working", "info");
-          ctx.ui.notify(await research.ideate(researchModelCall(ctx)), "info");
+          ctx.ui.notify("The outside advisor is working", "info");
+          ctx.ui.notify((await research.ideate(researchModelCall(ctx))).text, "info");
         } catch (error) {
           ctx.ui.notify(`Independent ideation failed: ${error instanceof Error ? error.message : String(error)}`, "error");
         }

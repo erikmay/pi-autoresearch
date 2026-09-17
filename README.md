@@ -21,7 +21,7 @@ Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). W
 
 ## Quick start
 
-For independent model review and fresh ideation agents, see [Independent research](INDEPENDENT_RESEARCH.md). This mode gates `keep` on measured holdout evidence and a separate reasoning model, and runs intelligent idea agents without experiment history.
+For independent model review and an outside advisor that proposes new approaches or stops an exhausted search, see [Independent research](INDEPENDENT_RESEARCH.md). This mode gates `keep` on measured holdout evidence and a separate reasoning model and closes approaches that stop paying off.
 
 ```bash
 pi install npm:pi-autoresearch

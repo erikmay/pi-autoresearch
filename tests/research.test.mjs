@@ -21,7 +21,7 @@ function fixture(t) {
   write('source.sh', 'PRIMARY=100\nHOLDOUT=100\n');
   write('.auto/measure.sh', '. ./source.sh\nprintf "METRIC time=%s\\n" "$PRIMARY"\n');
   write('.auto/holdout.sh', '. ./source.sh\nprintf "METRIC validation=%s\\n" "$HOLDOUT"\n');
-  write('.auto/research.json', JSON.stringify({ objective: 'Reduce execution time while preserving generalization.', constraints: ['Preserve correctness.'], sourceFiles: ['source.sh'], reviewModel: 'fake/reviewer', ideaModels: ['fake/algorithm', 'fake/alternative', 'fake/profiling'], validationMetrics: [{ name: 'validation', direction: 'lower', maxRegressionPercent: 0 }], repetitions: 3 }));
+  write('.auto/research.json', JSON.stringify({ objective: 'Reduce execution time while preserving generalization.', constraints: ['Preserve correctness.'], sourceFiles: ['source.sh'], validationMetrics: [{ name: 'validation', direction: 'lower', maxRegressionPercent: 0 }], repetitions: 3 }));
   for (const args of [['init', '-q'], ['config', 'user.email', 'test@example.invalid'], ['config', 'user.name', 'Research Test'], ['add', '.'], ['commit', '-qm', 'Baseline']]) {
     const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
     assert.equal(r.status, 0, r.stderr);
@@ -33,6 +33,16 @@ async function measure(f, session = f.session) {
   const r = await exec('bash', ['.auto/measure.sh'], { cwd: f.cwd, timeout: 10000 });
   const metric = Number(r.stdout.match(/^METRIC time=(\S+)/m)?.[1]);
   return session.measure(snapshot, 'time', metric, r.code === 0, r.stdout);
+}
+/** Establish the baseline (no model call), then measure a changed candidate at PRIMARY=90. */
+async function candidate(f, session = f.session) {
+  await measure(f, session);
+  let calls = 0;
+  await session.review(100, async () => { calls++; return accept(); });
+  assert.equal(calls, 0, 'The unchanged baseline must not invoke the evaluator.');
+  session.consume(true);
+  f.write('source.sh', 'PRIMARY=90\nHOLDOUT=100\n');
+  return measure(f, session);
 }
 
 test('fresh measured metric is required and cannot be replaced by a claimed value', async (t) => {
@@ -111,8 +121,8 @@ test('invalid or unavailable evaluator and outstanding validation fail closed', 
   for (const [index, response] of responses.entries()) {
     await t.test(String(index), async (t) => {
       const f = fixture(t);
-      await measure(f);
-      const result = await f.session.review(100, response);
+      await candidate(f);
+      const result = await f.session.review(90, response);
       assert.equal(result.review.accept, false);
       assert.throws(() => f.session.consume(true), /Missing independent acceptance/);
     });
@@ -133,29 +143,38 @@ test('failed benchmark and missing primary evidence never invoke the evaluator',
   }
 });
 
-test('fresh ideation excludes history and retains successful agents when another fails', async (t) => {
+test('the outside advisor sees approach names only, skips known approaches, and can stop the loop', async (t) => {
   const f = fixture(t);
   const marker = 'HISTORY_CONTAMINATION_SENTINEL';
   f.write('.auto/ideas.md', marker);
   f.write('.auto/log.jsonl', JSON.stringify({ description: marker, asi: { next_action_hint: marker } }));
   f.write('.auto/prompt.md', marker);
+  assert.throws(() => f.session.assertApproachOpen('Not Valid'), /kebab-case/);
+  for (const kept of [true, false, false]) assert.equal(f.session.recordApproach('value-cache', kept), false);
+  assert.equal(f.session.recordApproach('value-cache', false), true);
+  assert.throws(() => f.session.assertApproachOpen('value-cache'), /closed/);
+  assert.equal(f.session.recordApproach('field-order', false), false);
   const payloads = [];
   const result = await f.session.ideate(async (model, system, data) => {
     payloads.push({ model, system, data });
-    if (model === 'fake/alternative') throw new Error('Agent unavailable');
-    return JSON.stringify({ ideas: [{ hypothesis: 'Avoid redundant work.', change: 'Cache immutable computation.', mechanism: 'Compute once.', validation: 'Compare unseen workloads.' }] });
+    return JSON.stringify({ verdict: 'continue', reason: 'Untried directions remain.', ideas: [
+      { approach: 'Value Cache', hypothesis: 'Repeat.', change: 'Cache immutable computation.', mechanism: 'Compute once.', validation: 'Compare unseen workloads.' },
+      { approach: 'Batch Normalization', hypothesis: 'Fewer calls win.', change: 'Normalize all fields once.', mechanism: 'One conversion.', validation: 'Compare misses.' },
+    ] });
   });
-  assert.equal(payloads.length, 3);
-  for (const payload of payloads) {
-    assert.equal(JSON.stringify(payload).includes(marker), false);
-    assert.deepEqual(Object.keys(payload.data).sort(), ['constraints', 'objective', 'source']);
-  }
-  assert.match(result, /1 candidates \(1 agents failed\)/);
+  assert.equal(payloads.length, 1);
+  assert.equal(JSON.stringify(payloads[0]).includes(marker), false);
+  assert.deepEqual(Object.keys(payloads[0].data).sort(), ['approaches', 'constraints', 'objective', 'source']);
+  assert.deepEqual(payloads[0].data.approaches, { open: ['field-order (1 attempts, 0 kept)'], closed: ['value-cache (4 attempts, 1 kept)'] });
+  assert.equal(result.stop, false);
+  assert.match(result.text, /1 new approaches/);
   const journal = JSON.parse(fs.readFileSync(path.join(f.cwd, '.auto/ideation.jsonl'), 'utf8').trim());
-  assert.equal(journal.errors.length, 1);
-  assert.equal(journal.ideas.length, 2);
-  assert.equal((fs.readFileSync(path.join(f.cwd, '.auto/ideas.md'), 'utf8').match(/- \[ \]/g) || []).length, 1);
-  await assert.rejects(f.session.ideate(async () => { throw new Error('Unavailable'); }), /All idea agents failed/);
+  assert.deepEqual(journal.ideas.map((i) => i.approach), ['batch-normalization']);
+  assert.match(fs.readFileSync(path.join(f.cwd, '.auto/ideas.md'), 'utf8'), /- \[ \] Approach: batch-normalization \|/);
+  const stop = await f.session.ideate(async () => JSON.stringify({ verdict: 'stop', reason: 'The remaining work is noise.', ideas: [] }));
+  assert.equal(stop.stop, true);
+  assert.match(stop.text, /recommends stopping: The remaining work is noise/);
+  await assert.rejects(f.session.ideate(async () => { throw new Error('Unavailable'); }), /Unavailable/);
 });
 
 test('cancelled sessions cannot continue research', async (t) => {
@@ -203,12 +222,12 @@ function resetConfig(f, updates) {
 test('model requests time out even when the provider ignores cancellation', async (t) => {
   const f = fixture(t);
   const session = resetConfig(f, { timeoutSeconds: 1 });
-  await measure(f, session);
+  await candidate(f, session);
   const started = Date.now();
   // Keep Node alive because AbortSignal.timeout uses an unreferenced timer.
   const keepAlive = setInterval(() => {}, 100);
   try {
-    const result = await session.review(100, async () => new Promise(() => {}));
+    const result = await session.review(90, async () => new Promise(() => {}));
     assert.equal(result.review.accept, false);
     assert.match(result.review.reason, /cancelled or timed out/);
     assert.ok(Date.now() - started < 5000, 'Provider must not block beyond the configured deadline.');
@@ -220,11 +239,11 @@ test('model requests time out even when the provider ignores cancellation', asyn
 
 test('stopping a session during a model request prevents approval', async (t) => {
   const f = fixture(t);
-  await measure(f);
+  await candidate(f);
   let entered;
   const requestStarted = new Promise(resolve => { entered = resolve; });
   let modelSignal;
-  const pending = f.session.review(100, async (_model, _system, _data, signal) => {
+  const pending = f.session.review(90, async (_model, _system, _data, signal) => {
     modelSignal = signal;
     entered();
     return new Promise(() => {});
@@ -234,8 +253,9 @@ test('stopping a session during a model request prevents approval', async (t) =>
   await assert.rejects(pending, /Research session was stopped/);
   assert.equal(modelSignal.aborted, true);
   assert.throws(() => f.session.consume(true), /Research session was stopped/);
-  assert.equal(fs.existsSync(path.join(f.cwd, '.auto/reviews.jsonl')), false);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(f.cwd, '.auto/research-state.json'), 'utf8')).reference, null);
+  // Only the baseline review is journaled; the cancelled candidate never reaches the journal or the reference.
+  assert.equal(fs.readFileSync(path.join(f.cwd, '.auto/reviews.jsonl'), 'utf8').trim().split('\n').length, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.cwd, '.auto/research-state.json'), 'utf8')).reference, { validation: 100 });
 });
 
 test('evaluation helpers are frozen and full evaluation source reaches only the reviewer', async (t) => {
@@ -243,9 +263,9 @@ test('evaluation helpers are frozen and full evaluation source reaches only the 
   const marker = 'HOLDOUT_SOURCE_SENTINEL';
   f.write('.auto/helper.sh', `# ${marker}\nprintf "helper"\n`);
   const session = resetConfig(f, { evaluationFiles: ['.auto/helper.sh'] });
-  await measure(f, session);
+  await candidate(f, session);
   let reviewedData;
-  const result = await session.review(100, async (_model, _system, data) => {
+  const result = await session.review(90, async (_model, _system, data) => {
     reviewedData = data;
     return accept();
   });
@@ -256,18 +276,18 @@ test('evaluation helpers are frozen and full evaluation source reaches only the 
   await session.ideate(async (_model, _system, data) => {
     assert.equal(Object.hasOwn(data, 'evaluationSource'), false);
     assert.equal(JSON.stringify(data).includes(marker), false);
-    return JSON.stringify({ ideas: [{ hypothesis: 'Reduce comparisons.', change: 'Use a hash set.', mechanism: 'Track prior values.', validation: 'Check diverse arrays.' }] });
+    return JSON.stringify({ verdict: 'continue', reason: 'Open directions remain.', ideas: [{ approach: 'hash-set', hypothesis: 'Reduce comparisons.', change: 'Use a hash set.', mechanism: 'Track prior values.', validation: 'Check diverse arrays.' }] });
   });
   f.write('.auto/helper.sh', '# changed protected evaluation helper\n');
-  await assert.rejects(session.review(100, accept), /Protected research config or evaluation script changed/);
+  await assert.rejects(session.review(90, accept), /Protected research config or evaluation script changed/);
   assert.throws(() => new ResearchSession(f.cwd, exec), /Research contract changed/);
 });
 
 test('oversized evaluator output is rejected before parsing or acceptance', async (t) => {
   const f = fixture(t);
-  await measure(f);
+  await candidate(f);
   const response = JSON.stringify({ accept: true, reason: 'Accepted.', overfittingRisks: [], requiredValidation: [], padding: 'x'.repeat(33 * 1024) });
-  const result = await f.session.review(100, async () => response);
+  const result = await f.session.review(90, async () => response);
   assert.equal(result.review.accept, false);
   assert.match(result.review.reason, /Model response exceeds 32 KiB/);
   assert.throws(() => f.session.consume(true), /Missing independent acceptance/);

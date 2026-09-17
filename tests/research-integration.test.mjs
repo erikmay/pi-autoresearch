@@ -25,7 +25,7 @@ async function harness(t, maxIterations = 10, extraSources = []) {
   write(".auto/measure.sh", '. ./source.sh\nprintf "METRIC time=%s\\n" "$PRIMARY"\n');
   write(".auto/holdout.sh", '. ./source.sh\nprintf "METRIC validation=%s\\n" "$HOLDOUT"\n');
   write(".auto/config.json", JSON.stringify({ maxIterations }));
-  write(".auto/research.json", JSON.stringify({ objective: "Improve generic execution time.", sourceFiles: ["source.sh", ...extraSources], reviewModel: "openai-codex/gpt-6-astra", ideaModels: ["openai-codex/gpt-6-astra"], validationMetrics: [{ name: "validation", direction: "lower" }], repetitions: 1 }));
+  write(".auto/research.json", JSON.stringify({ objective: "Improve generic execution time.", sourceFiles: ["source.sh", ...extraSources], validationMetrics: [{ name: "validation", direction: "lower" }], repetitions: 1 }));
   for (const args of [["init", "-q"], ["config", "user.email", "test@example.invalid"], ["config", "user.name", "Research Test"], ["add", "."], ["commit", "-qm", "Baseline"]]) {
     assert.equal((await exec("git", args, { cwd })).code, 0);
   }
@@ -45,7 +45,7 @@ async function harness(t, maxIterations = 10, extraSources = []) {
         calls.push({ model: `${model.provider}/${model.id}`, context });
         const response = context.systemPrompt.includes("evaluator")
           ? { accept: decision, reason: decision ? "General improvement." : "Benchmark special case.", overfittingRisks: [], requiredValidation: [] }
-          : { ideas: [{ hypothesis: "Remove work", change: "Cache stable values", mechanism: "Avoid repeated reads", validation: "Compare varied inputs" }] };
+          : { verdict: "continue", reason: "Untried directions remain.", ideas: [{ approach: "stable-value-cache", hypothesis: "Remove work", change: "Cache stable values", mechanism: "Avoid repeated reads", validation: "Compare varied inputs" }] };
         return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify(response) }] };
       },
     },
@@ -60,7 +60,7 @@ async function harness(t, maxIterations = 10, extraSources = []) {
     exec: (command, args, options) => failCommit && command === "git" && args[0] === "commit"
       ? Promise.resolve({ code: 1, stdout: "", stderr: "Commit hook failed" }) : exec(command, args, options),
   });
-  const run = () => tools.get("run_experiment").execute("run", { command: "bash .auto/measure.sh" }, undefined, undefined, ctx);
+  const run = (approach = "baseline") => tools.get("run_experiment").execute("run", { command: "bash .auto/measure.sh", approach }, undefined, undefined, ctx);
   const log = (metric, status = "keep", extra = {}) => tools.get("log_experiment").execute("log", { commit: "abcdef0", metric, status, description: "EXPERIMENTER_CLAIM_DO_NOT_SEND", asi: { hypothesis: "HISTORY_DO_NOT_SEND" }, ...extra }, undefined, undefined, ctx);
   await tools.get("init_experiment").execute("init", { name: "Optimize time", metric_name: "time", direction: "lower" }, undefined, undefined, ctx);
   return { cwd, ctx, calls, write, run, log, commands, tools, abortCount: () => abortCount, activeTools: () => active, reject: () => { decision = false; }, failCommit: () => { failCommit = true; }, allowCommit: () => { failCommit = false; } };
@@ -71,7 +71,8 @@ test("independent acceptance commits actual code, captures review, and triggers 
   await f.run();
   const baseline = await f.log(100);
   assert.equal(baseline.details.experiment.status, "keep");
-  assert.ok(f.calls.some((c) => c.context.systemPrompt.includes("ideation agent")));
+  assert.ok(f.calls.some((c) => c.context.systemPrompt.includes("research advisor")));
+  assert.equal(f.calls.some((c) => c.context.systemPrompt.includes("evaluator")), false, "The unchanged baseline needs no review.");
   assert.ok(f.calls.every((c) => c.model === "openai-codex/gpt-6-astra"));
   f.write("source.sh", "PRIMARY=50\nHOLDOUT=50\n");
   await f.run();
@@ -137,7 +138,7 @@ test("failed Git commits do not record keep or advance the holdout reference", a
 test("shell chaining cannot replace canonical benchmark output", async (t) => {
   const f = await harness(t);
   for (const command of ["bash .auto/measure.sh >/dev/null; echo 'METRIC time=1'", "bash /tmp/other/.auto/measure.sh", "bash .auto/measure.sh --fake", "PRIMARY=1 bash .auto/measure.sh"]) {
-    const result = await f.tools.get("run_experiment").execute("spoof", { command }, undefined, undefined, f.ctx);
+    const result = await f.tools.get("run_experiment").execute("spoof", { command, approach: "spoof" }, undefined, undefined, f.ctx);
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /canonical benchmark/);
   }

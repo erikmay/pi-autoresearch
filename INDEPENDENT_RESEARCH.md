@@ -1,17 +1,15 @@
-# Independent review and fresh ideation
+# Independent review and an outside advisor
 
-Independent mode adds two authorities to the experiment loop:
+Independent mode adds two outside authorities to the experiment loop. Both use `openai-codex/gpt-6-astra`; the experimenter model must differ.
 
-- A separate reasoning model reviews candidates before `keep` can commit them.
-- Parallel ideation agents propose experiments from fresh requests without the experiment history.
+- A reviewer checks each candidate `keep` against frozen evidence before it is committed.
+- An advisor is consulted at turning points. It proposes genuinely new approaches or tells the loop to stop.
 
-Enable it with `.auto/research.json`. Existing sessions without this file retain their usual behavior.
+Enable it with `.auto/research.json`. Sessions without this file keep their usual behavior.
 
 ## Setup
 
 Create the usual `.auto/measure.sh`, then create `.auto/holdout.sh`. The holdout script must check correctness on inputs different from the optimization benchmark, exit nonzero on failure, and emit each configured validation metric exactly once as `METRIC name=number`.
-
-All external consultants use `openai-codex/gpt-6-astra`. Other consultant model IDs are rejected before requests are sent. The reviewer model must differ from the active experimenter model. For example, when the experimenter uses `openai-codex/gpt-5.6-sol`:
 
 ```json
 {
@@ -22,53 +20,66 @@ All external consultants use `openai-codex/gpt-6-astra`. Other consultant model 
   ],
   "sourceFiles": ["src/parser.ts"],
   "evaluationFiles": [".auto/measure.ts", ".auto/holdout.ts", "fixtures/validation.json"],
-  "reviewModel": "openai-codex/gpt-6-astra",
-  "ideaModels": ["openai-codex/gpt-6-astra", "openai-codex/gpt-6-astra", "openai-codex/gpt-6-astra"],
   "validationMetrics": [
     { "name": "validation_ms", "direction": "lower", "maxRegressionPercent": 2 }
   ],
   "repetitions": 3,
-  "ideaInterval": 5,
-  "stagnationThreshold": 3,
+  "approachBudget": 3,
   "timeoutSeconds": 180
 }
 ```
 
-Replace the file paths with your own. Repeated Astra entries create independent ideation requests with different roles; configure one to three entries. `sourceFiles` contains the production source the agent may change and all source needed for review. Changes to other production files block the experiment. `evaluationFiles` contains helper scripts and data used by measurement or validation. Include every such dependency: freezing a shell wrapper does not freeze a helper it imports. Evaluation files must not overlap production source files.
+`sourceFiles` contains the production source the agent may change and all source needed for review. Changes to other production files block the experiment. `evaluationFiles` contains helper scripts and data used by measurement or validation. Include every such dependency: freezing a shell wrapper does not freeze a helper it imports. Evaluation files must not overlap production source files.
+
+`approachBudget` is the number of failed experiments in a row that close one approach (default 3). Unknown keys are ignored.
 
 Run the benchmark as `bash .auto/measure.sh`. Independent mode executes this script directly and rejects arguments, environment prefixes, pipes, redirection, and chained commands.
 
-Start the session with `/autoresearch <goal>`. The usual initialization and baseline flow applies. `/autoresearch ideas` requests fresh ideas on demand. API calls use Pi's configured providers and authentication; no extra CLI or credentials file is required.
+Start the session with `/autoresearch <goal>`. `/autoresearch ideas` consults the advisor on demand. API calls use Pi's configured providers and authentication.
+
+## Approaches
+
+Every `run_experiment` names its approach: a short kebab-case name for the idea family the experiment belongs to, for example `field-order`. The unchanged baseline uses `baseline`. Variants of one idea share one name.
+
+An approach closes after `approachBudget` failed experiments in a row. A closed approach is rejected before the benchmark runs. This is what ends an idea that stopped paying off: the experimenter cannot keep tuning it. The system prompt tells the agent not to rename an exhausted idea.
+
+Approach counters live in `.auto/research-state.json` and survive restarts. Every log entry records its approach in `asi.approach`.
 
 ## Acceptance
 
-The first accepted run establishes a baseline. Later candidates must improve the primary metric over the best accepted run. Validation runs repeat independently and report the median of each metric. A regression beyond its configured tolerance rejects the candidate before a model request. Validation is compared with both the last accepted result and the original baseline, so small tolerated regressions cannot accumulate beyond the baseline tolerance.
+The first accepted run establishes the baseline. When the source has no changes against HEAD, the baseline needs measured evidence and a passing holdout but no model review.
 
-The reviewer receives only the objective, constraints, source snapshot, code diff, frozen evaluation files, captured benchmark output, and validation evidence. It does not receive the experimenter's descriptions, hypotheses, previous suggestions, or conversation messages. Each request starts with a fresh message array and no tools.
+Later candidates must improve the primary metric over the best accepted run. Validation runs repeat independently and report the median of each metric. A regression beyond its tolerance rejects the candidate before a model request. Validation is compared with both the last accepted result and the original baseline, so small tolerated regressions cannot accumulate.
 
-A model rejection converts a proposed `keep` into `discard` and restores the production source and Git index. Missing validation, provider errors, timeouts, invalid JSON, incomplete responses, or outstanding required validation cannot produce acceptance. Changed source, changed evaluation scripts, fabricated logged metrics, and reuse of consumed evidence block acceptance.
+Only then does the reviewer see the candidate. It receives the objective, constraints, source snapshot, code diff, frozen evaluation files, captured benchmark output, checks evidence, and validation evidence. It does not receive the experimenter's descriptions, hypotheses, or conversation messages. Each request starts with a fresh message array and no tools.
 
-When `.auto/checks.sh` exists, its measured pass status, output, and duration are included in the review evidence. Missing checks evidence, failed checks, or checks output above 32 KiB prevent acceptance. Ideation retries malformed JSON once with a fresh request; it does not include the malformed response or conversation history. Reviewer failures still reject the experiment.
+A rejection converts the proposed `keep` into `discard` and restores the production source and Git index. Missing validation, provider errors, timeouts, invalid JSON, incomplete responses, or outstanding required validation cannot produce acceptance. Changed source, changed evaluation scripts, fabricated logged metrics, and reuse of consumed evidence block acceptance. When `.auto/checks.sh` exists, failed or missing checks evidence blocks acceptance.
 
-The research contract and accepted validation reference survive restarts in `.auto/research-state.json`. An active session checks these files against its captured values. `off` cancels research requests; it keeps the saved reference. `clear` deletes the experiment log but also keeps this reference. To change the objective, metric, scope, or evaluation rules, stop the loop and create a new session explicitly. Archive the existing `.auto` directory and set up new session files.
+## Advisor
 
-## Ideation
+The advisor is consulted:
 
-Idea agents have separate roles: algorithm design, alternative approaches, and bottleneck analysis. They receive the objective, constraints, and current production source. They receive no backlog, discarded hypotheses, validation outputs, or conversation history.
+- once after the baseline,
+- whenever an approach closes,
+- after every `approachBudget` failed experiments in a row across approaches.
 
-Ideation runs after the baseline, at the configured interval, and when the discard/crash streak first reaches the stagnation threshold. Successful proposals survive another agent's failure. Each proposal records its hypothesis, concrete change, mechanism, validation plan, and model.
+It receives the objective, constraints, current source, and the list of open and closed approach names with attempt and keep counts. It never receives the log, the ideas backlog, holdout outputs, or conversation history.
 
-The extension removes exact repeated proposals before appending Markdown checkboxes to `.auto/ideas.md`. The experimenter then compares the new candidates with earlier runs. Semantic duplicate detection is not automatic. Mark completed ideas and record why an earlier failure is or is not relevant to the current source.
+It returns one of two verdicts. `continue` comes with three to five approaches that do not overlap with any listed one; the extension appends them as `- [ ] Approach: <name> | ...` lines to `.auto/ideas.md` and drops proposals whose name is already known. `stop` ends the loop with a reason. This is the only planned stop in independent mode: there is no iteration cap unless `.auto/config.json` sets one.
+
+Malformed JSON gets one fresh bounded retry. Advisor failures leave the loop running and are reported in the tool result.
 
 ## Evidence and limits
 
-`.auto/reviews.jsonl` records reviewer decisions and measured evidence. `.auto/ideation.jsonl` records proposals, model IDs, and agent failures. `asi.independent_review` links each reviewed experiment to its evidence ID and source fingerprint.
+`.auto/reviews.jsonl` records reviewer decisions and measured evidence. `.auto/ideation.jsonl` records each advisor consultation with the approach summary, verdict, reason, and proposals. `asi.independent_review` links each reviewed experiment to its evidence ID and source fingerprint.
 
-An independent model can detect correctness gaps and benchmark special cases missed by a small validation set. It cannot prove generalization. Repeatedly consulted validation data can itself become an optimization target. Keep a separate final evaluation dataset outside the loop and evaluate the final candidate once before accepting the overall result. The plugin's confidence display remains an advisory heuristic; it is not a statistical acceptance test.
+An independent model can detect correctness gaps and benchmark special cases missed by a small validation set. It cannot prove generalization. Keep a separate final evaluation dataset outside the loop and evaluate the final candidate once before accepting the overall result.
 
-Isolation here means separate model requests with no conversation history and no model tools. It is not an operating-system sandbox for the experimenter. Review quality depends on representative validation data, adequate source scope, and complete `evaluationFiles`. Do not treat the model as a security boundary against a deliberately hostile process with filesystem access.
+Isolation here means separate model requests with no conversation history and no model tools. It is not an operating-system sandbox for the experimenter. Do not treat the model as a security boundary against a hostile process with filesystem access.
 
-The complete source and evaluation snapshot must fit within 200 KiB. Benchmark output, each validation output, and model responses must fit within 32 KiB. Oversized evidence blocks acceptance rather than silently truncating the review. Timeout applies to each model request and validation invocation.
+The complete source and evaluation snapshot must fit within 200 KiB. Benchmark output, each validation output, and model responses must fit within 32 KiB. Oversized evidence blocks acceptance rather than silently truncating the review. The timeout applies to each model request and validation invocation.
+
+The research contract and accepted validation reference survive restarts in `.auto/research-state.json`. `off` cancels research requests and keeps the saved reference. To change the objective, metric, scope, or evaluation rules, stop the loop, archive `.auto`, and create a new session.
 
 ## Run the live example
 
@@ -79,10 +90,6 @@ pnpm install --frozen-lockfile
 bun examples/independent-research/validate.ts
 ```
 
-It checks a correct baseline, fresh intelligent ideation, a benchmark shortcut that passes the limited holdout but fails independent review, a deterministic validation regression, metric spoofing, edits after measurement, and a general algorithm improvement that gets committed. It uses operation counts to make acceptance boundaries deterministic; those counts are not wall-clock speed measurements.
+Override the executing model with `RESEARCH_EXPERIMENTER`. For a complete interactive loop, run `bun examples/independent-research/validate.ts --prepare-agent`, start Pi in the printed directory with this extension and its skills loaded, then run `/autoresearch optimize generic duplicate counting`. The loop runs until the advisor stops it.
 
-Override the executing model with `RESEARCH_EXPERIMENTER`. The reviewer and all three ideation agents use Astra. The live example uses the installed current Pi SDK. Automated tests use temporary Git repositories and deterministic model responses for failure cases.
-
-For a complete interactive agent loop, run `bun examples/independent-research/validate.ts --prepare-agent`. Start Pi in the printed directory with this extension loaded, then run `/autoresearch optimize generic duplicate counting`. Pi establishes the baseline, chooses an independently generated idea, implements it, and requests acceptance. The two-experiment limit lets it report the final result without an abort error.
-
-After the loop, run `bun examples/independent-research/final-evaluation.ts <example-directory>`. This checks new input distributions and reports baseline/candidate wall-clock medians across nine alternating-order measurements. These final cases are not sent back to the optimization loop.
+After the loop, run `bun examples/independent-research/final-evaluation.ts <example-directory>` to check new input distributions outside the loop.
