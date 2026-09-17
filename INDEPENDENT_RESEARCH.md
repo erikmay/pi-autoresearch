@@ -48,6 +48,8 @@ The reviewer receives only the objective, constraints, source snapshot, code dif
 
 A model rejection converts a proposed `keep` into `discard` and restores the production source and Git index. Missing validation, provider errors, timeouts, invalid JSON, incomplete responses, or outstanding required validation cannot produce acceptance. Changed source, changed evaluation scripts, fabricated logged metrics, and reuse of consumed evidence block acceptance.
 
+When `.auto/checks.sh` exists, its measured pass status, output, and duration are included in the review evidence. Missing checks evidence, failed checks, or checks output above 32 KiB prevent acceptance. Ideation retries malformed JSON once with a fresh request; it does not include the malformed response or conversation history. Reviewer failures still reject the experiment.
+
 The research contract and accepted validation reference survive restarts in `.auto/research-state.json`. An active session checks these files against its captured values. `off` cancels research requests; it keeps the saved reference. `clear` deletes the experiment log but also keeps this reference. To change the objective, metric, scope, or evaluation rules, stop the loop and create a new session explicitly. Archive the existing `.auto` directory and set up new session files.
 
 ## Ideation

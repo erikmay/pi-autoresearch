@@ -2037,7 +2037,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const parsedPrimary = parsedMetricMap.get(state.metricName) ?? null;
 
       const researchEvidence = research && researchSnapshot
-        ? await research.measure(researchSnapshot, state.metricName, parsedPrimary, passed, output, signal, actualTotalBytes)
+        ? await research.measure(researchSnapshot, state.metricName, parsedPrimary, passed, output, signal, actualTotalBytes,
+          checksPass === null ? undefined : { passed: checksPass, output: checksOutput, durationSeconds: checksDuration })
         : undefined;
 
       const details: RunDetails = {

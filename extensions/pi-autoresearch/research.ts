@@ -142,6 +142,7 @@ export interface Evidence {
   primaryName: string;
   benchmarkPassed: boolean;
   benchmarkOutput: string;
+  checks?: { passed: boolean; output: string; durationSeconds: number };
   validation: Record<string, number>;
   validationOutput: string[];
   validationPassed: boolean;
@@ -279,13 +280,16 @@ export class ResearchSession {
     return this.snapshot(signal);
   }
 
-  async measure(snapshot: Snapshot, primaryName: string, primary: number | null, passed: boolean, output: string, signal?: AbortSignal, totalOutputBytes = Buffer.byteLength(output)): Promise<Evidence> {
+  async measure(snapshot: Snapshot, primaryName: string, primary: number | null, passed: boolean, output: string, signal?: AbortSignal, totalOutputBytes = Buffer.byteLength(output), checks?: Evidence["checks"]): Promise<Evidence> {
     const evidence: Evidence = {
       id: randomUUID(), snapshot, primaryName, primary, benchmarkPassed: passed,
       benchmarkOutput: output.slice(-MAX_OUTPUT_BYTES), validation: {}, validationOutput: [], validationPassed: false,
+      checks: checks ? { ...checks } : undefined,
     };
     this.evidence = evidence;
     try {
+      if (fs.existsSync(sessionFilePath(this.cwd, "checks")) && !checks) throw new Error("Missing measured checks evidence");
+      if (checks && (!checks.passed || Buffer.byteLength(checks.output) > MAX_OUTPUT_BYTES)) throw new Error("Checks failed or checks output exceeds 32 KiB");
       if (!passed || primary === null || !Number.isFinite(primary)) throw new Error("A successful benchmark with a structured primary METRIC is required");
       const primaryLines = [...output.matchAll(/^METRIC\s+([\w.µ]+)=(\S+)\s*$/gm)].filter((m) => m[1] === primaryName);
       if (primaryLines.length !== 1 || Number(primaryLines[0][2]) !== primary) throw new Error("Primary metric must occur exactly once in benchmark output");
@@ -343,6 +347,7 @@ export class ResearchSession {
           `You are an independent experiment evaluator. ${DATA_RULE} Assess correctness, generalization, benchmark special cases, hidden tradeoffs, and whether validation supports this change. If holdoutReference is null, assess establishment of a correct baseline; no prior improvement is required. Missing evidence means reject. Return {"accept":boolean,"reason":string,"overfittingRisks":string[],"requiredValidation":string[]}. Accept only when requiredValidation is empty.`,
           { objective: this.config.objective, constraints: this.config.constraints, source: e.snapshot.files, diff: e.snapshot.diff, evaluationSource: e.snapshot.evaluationSource,
             benchmark: { name: e.primaryName, measured: e.primary, direction: primaryContext?.direction, reference: primaryContext?.reference, passed: e.benchmarkPassed, output: e.benchmarkOutput },
+            checks: e.checks ?? null,
             holdoutRules: this.config.validationMetrics, holdoutReference: this.state.reference, holdoutBaseline: this.state.baseline,
             holdout: { passed: e.validationPassed, medians: e.validation, outputs: e.validationOutput } }, signal);
         const r = object(JSON.parse(raw));
@@ -390,8 +395,15 @@ export class ResearchSession {
       // Deliberately exclude the log, ideas backlog, experimenter notes, and holdout outputs.
       const data = { objective: this.config.objective, constraints: this.config.constraints, source: snapshot.files };
       const results = await Promise.allSettled(this.config.ideaModels.map(async (model, index) => {
-        const raw = await this.invoke(call, model, `You are a fresh research ideation agent. ${ROLES[index % ROLES.length]} ${DATA_RULE} Propose three diverse, actionable experiments. Each needs a falsifiable hypothesis, concrete change, mechanism, and validation plan. Return {"ideas":[{"hypothesis":string,"change":string,"mechanism":string,"validation":string}]}.`, data, signal);
-        const response = object(JSON.parse(raw));
+        const system = `You are a fresh research ideation agent. ${ROLES[index % ROLES.length]} ${DATA_RULE} Propose three diverse, actionable experiments. Each needs a falsifiable hypothesis, concrete change, mechanism, and validation plan. Keep each field to one short sentence. Return {"ideas":[{"hypothesis":string,"change":string,"mechanism":string,"validation":string}]}.`;
+        let response: Record<string, unknown>;
+        try {
+          response = object(JSON.parse(await this.invoke(call, model, system, data, signal)));
+        } catch (error) {
+          // Retry malformed JSON once in a fresh request, without recycling its output.
+          if (!(error instanceof SyntaxError)) throw error;
+          response = object(JSON.parse(await this.invoke(call, model, system + " Ensure valid JSON with escaped strings and no trailing commas.", data, signal)));
+        }
         if (!Array.isArray(response.ideas) || !response.ideas.length || response.ideas.length > 5) throw new Error("Invalid ideas response");
         return response.ideas.map((value) => {
           const idea = object(value);
