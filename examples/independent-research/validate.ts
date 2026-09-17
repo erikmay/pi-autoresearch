@@ -1,4 +1,4 @@
-/** Run with Bun in Herdr. Requests real reasoning models and preserves all evidence. */
+/** Prepare an agent loop or validate measured acceptance with a real outside advisor. */
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -68,28 +68,25 @@ assert.ok(Number.isFinite(result.operations) && result.operations >= 0);
 console.log('METRIC operations=' + result.operations);
 `);
 write(".auto/measure.sh", "bun .auto/measure.mjs\n");
-write(".auto/holdout.sh", `bun --eval '
+write(".auto/checks.sh", `bun --eval '
 import assert from "node:assert/strict";
 import { duplicates } from "./duplicates.mjs";
-const datasets = [[], [1], [1,2,1,3,2,4,1], Array.from({length:19}, (_,i) => i % 7)];
-let operations = 0;
+const datasets = [[], [1], [1,2,1,3,2,4,1], Array.from({length:19}, (_,i) => i % 7), Array(400).fill(1)];
 for (const input of datasets) {
   const result = duplicates(input);
   assert.equal(result.duplicates, input.length - new Set(input).size);
   assert.ok(Number.isFinite(result.operations) && result.operations >= 0);
-  operations += result.operations;
 }
-console.log("METRIC holdout_operations=" + operations);
+console.log("Correctness checks passed.");
 '\n`);
 write(".auto/research.json", JSON.stringify({
   objective: "Reduce generic duplicate-counting work for arbitrary arrays of finite numbers. The result counts each occurrence after the first. The operation counter must count actual examined values or comparisons consistently; do not fabricate it.",
   constraints: ["Preserve correct duplicate counts on arbitrary lengths and distributions.", "Do not special-case benchmark sizes or known data.", "Report an honest operation counter."],
   sourceFiles: ["duplicates.mjs"], evaluationFiles: [".auto/measure.mjs"],
-  validationMetrics: [{ name: "holdout_operations", direction: "lower", maxRegressionPercent: 0 }],
-  repetitions: 3, approachBudget: 2, timeoutSeconds: 300,
+  failureInterval: 3, timeoutSeconds: 300,
 }, null, 2));
 if (process.argv.includes("--prepare-agent")) {
-  write(".auto/prompt.md", "# Generic duplicate counting\n\nObjective: reduce generic duplicate-counting work for arbitrary arrays of finite numbers. Keep the operation counter honest. No benchmark special cases.\nPrimary metric: operations, lower is better.\nRun: bash .auto/measure.sh\nScope: duplicates.mjs only. Evaluation and configuration files are off limits.\nEstablish the baseline first with approach baseline. Read .auto/ideas.md after the baseline, choose one approach, pass its name to run_experiment, implement it, measure it, and request keep. There is no experiment limit: keep going until the outside advisor tells you to stop.\n");
+  write(".auto/prompt.md", "# Generic duplicate counting\n\nObjective: reduce generic duplicate-counting work for arbitrary arrays of finite numbers. Keep the operation counter honest. No benchmark special cases.\nPrimary metric: operations, lower is better.\nRun: bash .auto/measure.sh\nScope: duplicates.mjs only. Evaluation and configuration files are off limits.\nEstablish the baseline first with approach baseline. Read the outside advisor suggestions in .auto/ideas.md after the baseline. Choose a useful experiment, use an approach name, implement it, measure it, and keep it only when correctness checks pass and the measured primary improves. There is no experiment limit: keep going until the outside advisor tells you to stop.\n");
 }
 
 async function exec(command: string, args: string[], options: any) {
@@ -144,46 +141,38 @@ const entries = () => fs.readFileSync(path.join(cwd, ".auto/log.jsonl"), "utf8")
 async function log(metric: number, description: string, status = "keep") {
   return tool("log_experiment", { commit: (await head()).slice(0, 7), metric, status, description, asi: { hypothesis: description } });
 }
-async function run(approach = "baseline") {
+async function run(approach = "baseline", expectedPass = true) {
   const result = await tool("run_experiment", { command: "bash .auto/measure.sh", timeout_seconds: 30, approach });
-  assert.equal(result.details.passed, true);
+  assert.equal(result.details.passed, expectedPass);
   return result.details.parsedPrimary;
 }
 const checks: Record<string, unknown>[] = [];
 try {
-  await tool("init_experiment", { name: "Live independent evaluation", metric_name: "operations", direction: "lower" });
+  await tool("init_experiment", { name: "Live research advisor", metric_name: "operations", direction: "lower" });
   assert.equal((await log(1, "No evidence")).isError, true);
   checks.push({ case: "keep without measurement", outcome: "blocked" });
   await log(await run(), "Establish correct generic baseline");
   assert.equal(entries().at(-1).status, "keep");
   assert.ok(modelRequests.includes(CONSULTANT_MODEL));
   assert.ok(fs.readFileSync(path.join(cwd, ".auto/ideas.md"), "utf8").includes("- [ ]"));
-  checks.push({ case: "baseline and fresh ideation", outcome: "accepted", models: [...modelRequests] });
+  checks.push({ case: "baseline and outside advice", outcome: "accepted", models: [...modelRequests] });
 
   const baselineHead = await head();
   write("duplicates.mjs", baseline.replace("  let duplicates", "  if (values.length === 400) return { duplicates: 0, operations: 1 };\n  let duplicates"));
-  await log(await run("size-shortcut"), "Benchmark size shortcut");
-  assert.equal(entries().at(-1).status, "discard");
+  const invalidMetric = await run("size-shortcut", false);
+  const invalidKeep = await log(invalidMetric, "Benchmark size shortcut");
+  assert.match(invalidKeep.content[0].text, /Cannot keep/);
+  await log(invalidMetric, "Correctness checks rejected a benchmark shortcut", "checks_failed");
+  assert.equal(entries().at(-1).status, "checks_failed");
   assert.equal(await head(), baselineHead);
-  assert.match(entries().at(-1).asi.independent_review.reason, /./);
   assert.equal(fs.readFileSync(path.join(cwd, "duplicates.mjs"), "utf8"), baseline);
-  checks.push({ case: "shortcut missed by holdout", outcome: "model rejected", reason: entries().at(-1).asi.independent_review.reason });
-
-  const beforeRegressionCalls = modelRequests.length;
-  write("duplicates.mjs", general.replace("return { duplicates, operations }", "return { duplicates, operations: operations + (values.length === 400 ? 0 : 100000) }"));
-  await log(await run("size-shortcut"), "Improve benchmark but regress other workloads");
-  assert.equal(entries().at(-1).status, "discard");
-  assert.equal(modelRequests.length, beforeRegressionCalls);
-  assert.match(entries().at(-1).asi.independent_review.reason, /Holdout regression/);
-  checks.push({ case: "holdout regression", outcome: "deterministic rejection" });
+  checks.push({ case: "benchmark shortcut", outcome: "correctness checks rejected" });
 
   write("duplicates.mjs", general);
   const metric = await run("hash-set");
   assert.equal((await log(metric - 1, "Spoof measured metric")).isError, true);
-  await log(metric, "Consume spoof attempt evidence", "discard");
   checks.push({ case: "metric spoof", outcome: "blocked" });
-  write("duplicates.mjs", general);
-  const measured = await run("hash-set");
+  const measured = metric;
   write("duplicates.mjs", general + "// Changed after measurement.\n");
   assert.equal((await log(measured, "Edit after measurement")).isError, true);
   await log(measured, "Discard changed source", "discard");
@@ -196,7 +185,8 @@ try {
   assert.equal(fs.readFileSync(path.join(cwd, "duplicates.mjs"), "utf8"), general);
   assert.equal(await git("status", "--porcelain"), "");
   assert.equal((await log(400, "Reuse consumed evidence")).isError, true);
-  checks.push({ case: "general Set improvement", outcome: "accepted and committed", commit: await head(), reason: entries().at(-1).asi.independent_review.reason });
+  checks.push({ case: "general Set improvement", outcome: "measured improvement committed without a reviewer", commit: await head() });
+  await commands.get("autoresearch").handler("ideas", ctx);
   console.log(`VALIDATED ${JSON.stringify(checks, null, 2)}`);
 } finally {
   await commands.get("autoresearch").handler("off", ctx);

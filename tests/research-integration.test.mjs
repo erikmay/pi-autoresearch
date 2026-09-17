@@ -22,10 +22,10 @@ async function harness(t, maxIterations = 10, extraSources = []) {
   const write = (name, value) => fs.writeFileSync(path.join(cwd, name), value);
   write(".gitignore", ".auto/\n");
   write("source.sh", "PRIMARY=100\nHOLDOUT=100\n");
-  write(".auto/measure.sh", '. ./source.sh\nprintf "METRIC time=%s\\n" "$PRIMARY"\n');
-  write(".auto/holdout.sh", '. ./source.sh\nprintf "METRIC validation=%s\\n" "$HOLDOUT"\n');
+  write(".auto/measure.sh", '. ./source.sh\nif test "${RECOGNITION:-pass}" = fail; then printf "VALIDATION_FAILED baseline code lost\\n"; exit 1; fi\nprintf "METRIC time=%s\\n" "$PRIMARY"\n');
+  write(".auto/checks.sh", '. ./source.sh\ntest "$HOLDOUT" -le 100\n');
   write(".auto/config.json", JSON.stringify({ maxIterations }));
-  write(".auto/research.json", JSON.stringify({ objective: "Improve generic execution time.", sourceFiles: ["source.sh", ...extraSources], validationMetrics: [{ name: "validation", direction: "lower" }], repetitions: 1 }));
+  write(".auto/research.json", JSON.stringify({ objective: "Improve generic execution time.", sourceFiles: ["source.sh", ...extraSources], failureInterval: 2 }));
   for (const args of [["init", "-q"], ["config", "user.email", "test@example.invalid"], ["config", "user.name", "Research Test"], ["add", "."], ["commit", "-qm", "Baseline"]]) {
     assert.equal((await exec("git", args, { cwd })).code, 0);
   }
@@ -43,8 +43,8 @@ async function harness(t, maxIterations = 10, extraSources = []) {
       find: (provider, id) => ({ provider, id, reasoning: true }),
       async complete(model, context) {
         calls.push({ model: `${model.provider}/${model.id}`, context });
-        const response = context.systemPrompt.includes("evaluator")
-          ? { accept: decision, reason: decision ? "General improvement." : "Benchmark special case.", overfittingRisks: [], requiredValidation: [] }
+        const response = !decision
+          ? { verdict: "stop", reason: "No useful direction remains.", ideas: [] }
           : { verdict: "continue", reason: "Untried directions remain.", ideas: [{ approach: "stable-value-cache", hypothesis: "Remove work", change: "Cache stable values", mechanism: "Avoid repeated reads", validation: "Compare varied inputs" }] };
         return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify(response) }] };
       },
@@ -66,13 +66,13 @@ async function harness(t, maxIterations = 10, extraSources = []) {
   return { cwd, ctx, calls, write, run, log, commands, tools, abortCount: () => abortCount, activeTools: () => active, reject: () => { decision = false; }, failCommit: () => { failCommit = true; }, allowCommit: () => { failCommit = false; } };
 }
 
-test("independent acceptance commits actual code, captures review, and triggers fresh ideation", async (t) => {
+test("measured acceptance commits actual code and the manual advisor can stop the loop", async (t) => {
   const f = await harness(t);
   await f.run();
   const baseline = await f.log(100);
   assert.equal(baseline.details.experiment.status, "keep");
   assert.ok(f.calls.some((c) => c.context.systemPrompt.includes("research advisor")));
-  assert.equal(f.calls.some((c) => c.context.systemPrompt.includes("evaluator")), false, "The unchanged baseline needs no review.");
+  assert.equal(f.calls.some((c) => c.context.systemPrompt.includes("evaluator")), false, "Acceptance needs no reviewer.");
   assert.ok(f.calls.every((c) => c.model === "openai-codex/gpt-6-astra"));
   f.write("source.sh", "PRIMARY=50\nHOLDOUT=50\n");
   await f.run();
@@ -84,31 +84,43 @@ test("independent acceptance commits actual code, captures review, and triggers 
     assert.equal(JSON.stringify(c.context).includes("HISTORY_DO_NOT_SEND"), false);
     assert.equal(c.context.messages.length, 1);
   }
-  assert.match(result.content[0].text, /Independent review: accepted/);
+  assert.equal(f.calls.length, 1);
+  f.reject();
+  await f.commands.get("autoresearch").handler("ideas", f.ctx);
+  assert.equal(f.activeTools().includes("run_experiment"), false);
+  assert.equal(f.abortCount(), 0);
   assert.equal((await f.log(50)).isError, true);
 });
 
-test("model rejection and holdout regression revert candidates without committing", async (t) => {
+test("correctness failures revert candidates and trigger advisor guidance across approaches", async (t) => {
   const f = await harness(t);
   await f.run(); await f.log(100);
   const head = (await exec("git", ["rev-parse", "HEAD"], { cwd: f.cwd })).stdout;
   f.write("source.sh", "PRIMARY=1\nHOLDOUT=110\n");
-  await f.run();
-  const regression = await f.log(1);
-  assert.equal(regression.details.experiment.status, "discard");
-  assert.match(regression.content[0].text, /Holdout regression/);
+  await f.run("first-idea");
+  assert.match((await f.log(1)).content[0].text, /Cannot keep/);
+  const rejected = await f.log(1, "checks_failed");
+  assert.equal(rejected.details.experiment.status, "checks_failed");
   f.reject();
-  f.write("source.sh", "PRIMARY=1\nHOLDOUT=100\n");
+  f.write("source.sh", "PRIMARY=1\nHOLDOUT=100\nRECOGNITION=fail\n");
   await exec("git", ["add", "source.sh"], { cwd: f.cwd });
-  await f.run();
-  const rejected = await f.log(1);
-  assert.equal(rejected.details.experiment.status, "discard");
+  const validation = await f.run("second-idea");
+  assert.equal(validation.details.validationFailed, true);
+  assert.equal(validation.details.crashed, false);
+  const stopped = await f.log(0, "crash");
+  assert.equal(stopped.details.experiment.status, "checks_failed");
+  const history = JSON.parse(f.calls.at(-1).context.messages[0].content).recentResults;
+  assert.match(history.at(-1).failure, /baseline code lost/);
+  assert.equal(history.at(-1).checksPassed, null);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.activeTools().includes("run_experiment"), false);
+  assert.match(stopped.content[0].text, /STOP the experiment loop/);
   assert.equal((await exec("git", ["rev-parse", "HEAD"], { cwd: f.cwd })).stdout, head);
   assert.equal(fs.readFileSync(path.join(f.cwd, "source.sh"), "utf8"), "PRIMARY=100\nHOLDOUT=100\n");
   assert.equal((await exec("git", ["diff", "--cached", "--name-only"], { cwd: f.cwd })).stdout, "");
 });
 
-test("spoofed metrics, stale code, changed contract, and matching reviewer model block acceptance", async (t) => {
+test("spoofed metrics, stale code, changed contract, and matching advisor model block acceptance", async (t) => {
   const f = await harness(t);
   assert.equal((await f.log(1)).isError, true);
   await f.run();
@@ -124,13 +136,13 @@ test("spoofed metrics, stale code, changed contract, and matching reviewer model
   assert.equal(fs.readFileSync(path.join(f.cwd, ".auto/log.jsonl"), "utf8").split("\n").filter(Boolean).length, 1);
 });
 
-test("failed Git commits do not record keep or advance the holdout reference", async (t) => {
+test("failed Git commits do not record keep and allow a retry", async (t) => {
   const f = await harness(t);
   await f.run(); await f.log(100);
   f.write("source.sh", "PRIMARY=50\nHOLDOUT=50\n");
   await f.run(); f.failCommit();
   assert.equal((await f.log(50)).isError, true);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(f.cwd, ".auto/research-state.json"), "utf8")).reference.validation, 100);
+  assert.equal(fs.readFileSync(path.join(f.cwd, ".auto/log.jsonl"), "utf8").trim().split("\n").length, 2);
   f.allowCommit();
   assert.equal((await f.log(50)).details.experiment.status, "keep");
 });
@@ -155,7 +167,7 @@ test("reinitialization invalidates pending evidence and cannot reset an accepted
   assert.equal(reinit.isError, true);
 });
 
-test("a worse primary cannot be kept even with unchanged holdout and an accepting reviewer", async (t) => {
+test("a worse primary cannot be kept even with passing correctness checks", async (t) => {
   const f = await harness(t);
   await f.run(); await f.log(100);
   f.write("source.sh", "PRIMARY=110\nHOLDOUT=100\n");
@@ -177,7 +189,7 @@ test("iteration limit returns the accepted result and disables tools without abo
   assert.equal(f.activeTools().includes("run_experiment"), false);
 });
 
-test("approved new source files can be staged and committed without invalidating measured code", async (t) => {
+test("new source files can be staged and committed without invalidating measured code", async (t) => {
   const f = await harness(t, 10, ["extra.sh"]);
   await f.run(); await f.log(100);
   f.write("extra.sh", "PRIMARY=50\n");

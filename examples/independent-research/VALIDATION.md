@@ -1,81 +1,50 @@
 # Validation record
 
-Validated locally on 2026-09-17 with Pi 0.85.1 and Herdr. The implementation branch is `feat/independent-research`.
-
-## Consultant policy update
-
-Following the user's model-selection instruction, future evaluation and ideation requests use only `openai-codex/gpt-6-astra`. The example now runs three separate Astra ideation requests with different roles. Other external consultant IDs are blocked before API requests. The integration checks require all consultant calls to use Astra.
-
-The real model results below record the earlier mixed-model validation. They remain historical evidence; they do not claim a new complete Astra-only live run.
+Validated locally on 2026-09-17 for the simplified outside advisor on `feat/independent-research`.
 
 ## Automated checks
 
-`pnpm test` passed all 101 tests. The suite includes real temporary Git repositories and actual Bash measurements. Deterministic model responses exercise acceptance, rejection, malformed responses, provider errors, cancellation, and deadlines.
+`pnpm test` passed all 88 tests. Existing research checks were adapted to the advisor-only behavior. Tests for the removed model reviewer and holdout-reference state were removed.
 
-The acceptance checks cover missing/consumed evidence, primary metric spoofing, code changes after measurement, shell chaining, changes to frozen scripts and helpers, holdout regressions, cumulative tolerance drift, outstanding required validation, failed commits, staged candidate restoration, target reinitialization, and graceful completion at the iteration limit.
+The checks cover measured metric binding, consumed evidence, source changes, canonical benchmark execution, protected scripts and helpers, correctness failures, failed commits, new source files, permission changes, and configured experiment limits.
 
-The final fingerprint check also covers new production files and permission changes. Fingerprints use source contents, permissions, HEAD, changed paths, and evaluation source. Staging a new file may change the textual diff but must not invalidate an otherwise unchanged measured candidate.
+Advisor checks cover measured result history, useful variants of previous approaches, fresh context without conversation or experimenter claims, provider errors, cancellation, timeouts, and oversized responses. Integration checks cover automatic advice after correctness failures across approaches and a manual advisor stop that disables the experiment tools without aborting the agent's final response.
 
-Fresh-request checks verify one user message, no experimenter hypotheses or descriptions, no historical backlog during generation, successful proposals when another agent fails, and evaluation-source visibility only for the reviewer.
+`git diff --check` passed.
 
-`research.ts` passed a standalone TypeScript check. A full check of the original extension fails on existing upstream schema/API typings; the same failures reproduce on `origin/main`. The repository's existing Node tests and the actual Pi extension load pass.
+## Real advisor requests
 
-`pnpm pack --pack-destination /tmp` included the new module, instructions, and live examples.
-
-## Real model evaluation
-
-The live driver invokes the production extension tools and real Pi model requests. The evaluator is `openai-codex/gpt-5.5`. The fresh ideation agents use `openai-codex/gpt-6-astra` and `openai-codex/gpt-5.5` with high reasoning.
+The live driver invoked the production extension tools and made two real requests to `openai-codex/gpt-6-astra`. It supplied an experimenter identity of `openai-codex/gpt-5.6-sol`. The driver controls the experiments; this was not a new complete interactive agent-loop run.
 
 | Case | Observed result |
 | --- | --- |
-| Correct quadratic baseline | Accepted; validation reference established |
-| Fresh ideation | Six actionable proposals from two reasoning models |
-| Return zero duplicates for every length-400 array | Limited holdout passed; independent model rejected incorrect benchmark special case |
-| Lower benchmark count but higher holdout count | Rejected before model request |
+| Keep without measurement | Blocked |
+| Correct quadratic baseline | Kept; advisor proposed a hash-set approach |
+| Return zero duplicates for every length-400 array | Correctness checks failed; candidate restored |
 | Submit a different primary number | Blocked |
 | Change source after measurement | Blocked |
-| Generic Set algorithm | Accepted and committed |
-| Reuse consumed evidence | Blocked |
+| Generic Set algorithm | Kept and committed without a model reviewer |
+| Reuse the accepted result | Blocked |
+| Manual advice after the improvement | Advisor returned stop; experiment tools disabled |
 
-The operation-count fixture makes gate behavior deterministic. It is an abstract metric: the baseline counts pairwise comparisons, while the optimized implementation counts examined input values. It does not establish a wall-clock speed ratio.
+The example primary metric fell from 79,800 pairwise comparisons to 400 examined values. This operation count demonstrates gate behavior and algorithmic work; it does not establish a wall-clock speed ratio.
 
-The final driver run used the current implementation after acceptance hardening. Its full report and raw journals are retained at `/var/folders/56/6f72k6k90_71wwhk5vpw9wvw0000gn/T/pi-independent-live-yHxQnH/.auto/`. The driver completed every assertion and committed the general candidate as `2951b83d2e73342f294fb844ed65c294fb1e0621` in that example repository.
-
-## Complete Pi agent loop
-
-A real Pi agent, `openai-codex/gpt-5.6-sol`, ran in the Herdr test pane. It read the session prompt, established the baseline, read the independent proposals, chose a Set implementation, edited only `duplicates.mjs`, measured it, and requested acceptance.
-
-The reviewer accepted the implementation. The extension committed it as `0ed9c0b57ed3ffa81982686947c8aaf57d281e03` in the temporary example repository. The primary count changed from 79,800 to 400; validation changed from 77 to 27. The two-experiment limit disabled the experiment tools and the agent returned a normal final summary without an abort error.
-
-Example artifacts are retained at `/var/folders/56/6f72k6k90_71wwhk5vpw9wvw0000gn/T/pi-independent-live-bzhVp1/.auto/`. Review and ideation journals contain model IDs, fingerprints, proposals, and actual decisions. The terminal transcript is `/tmp/pi-independent-agent-final-transcript.txt`.
+Artifacts are retained at `/var/folders/56/6f72k6k90_71wwhk5vpw9wvw0000gn/T/pi-independent-live-ISC9AT/.auto/`. The accepted example commit is `75263983de1ddcfa101e84d15195d915646fdeb3`. `live-report.json`, `ideation.jsonl`, and `log.jsonl` record the requests, decisions, and measurements.
 
 ## Evaluation outside the loop
 
-After the completed agent loop, six new cases checked empty arrays, repeated values at the benchmark length, prime lengths, signed zero, fractions, large distinct negative values, and large repeated fractional values. All passed. These cases were not sent back to the optimization agent.
+`final-evaluation.ts` passed all six correctness cases after the driver finished. It also measured nine alternating-order timing samples per larger dataset.
 
-Nine alternating-order timing measurements produced these local medians:
-
-| New dataset | Baseline | Candidate |
+| Dataset | Baseline median | Candidate median |
 | --- | ---: | ---: |
-| 997 values, repeated integers | 0.0223 ms | 0.00592 ms |
-| 16,001 distinct negative/positive integers | 48.82 ms | 0.220 ms |
-| 20,011 repeated fractions | 0.612 ms | 0.0436 ms |
+| 997 values, repeated integers | 0.0252 ms | 0.00546 ms |
+| 16,001 distinct negative/positive integers | 50.11 ms | 0.191 ms |
+| 20,011 repeated fractions | 0.638 ms | 0.0458 ms |
 
-These measurements demonstrate the example's general improvement on new inputs. They are local microbenchmarks, not a performance guarantee for other projects. Independent review also cannot prove generalization for arbitrary future workloads; retain separate final validation for each real optimization target.
+These are local microbenchmarks. The report is retained in `final-evaluation.json`. Final evaluation results were not returned to the advisor or optimization loop.
 
-Reproduce with `validate.ts`, or prepare an interactive loop with `validate.ts --prepare-agent`. Run `final-evaluation.ts <completed-example-directory>` only after the optimization loop finishes.
+## Reproduction
 
-## Live loop with approaches and the outside advisor (2026-09-17)
+Run `bun examples/independent-research/validate.ts` for the scripted validation with real advisor requests. Run it with `--prepare-agent` to prepare an interactive Pi loop. After completion, run `bun examples/independent-research/final-evaluation.ts <example-directory>`.
 
-A real Pi agent (`openai-codex/gpt-5.6-sol`) ran the prepared example in a Herdr tab with the extension and its skills loaded, no iteration cap, and `approachBudget: 2`. Consultant: `openai-codex/gpt-6-astra`.
-
-| Run | Approach | Result |
-| --- | --- | --- |
-| 1 | baseline | Kept without a model review; holdout reference established |
-| 2 | hash-set-membership | Reviewer accepted; committed (79,800 → 400 operations) |
-| 3 | sort-count-runs | Discarded (2,287 operations) |
-| 4 | radix-number-keys | Discarded (7,199 operations) |
-
-Astra was consulted three times in total: one review and two advisor calls. The first advisor call after the baseline returned three non-overlapping approaches. The second, after two failures in a row, returned `stop` because exact duplicate counting must examine every element. The extension ended the loop and the agent reported the accepted result.
-
-Artifacts: `/var/folders/56/6f72k6k90_71wwhk5vpw9wvw0000gn/T/pi-independent-live-6ZtTto/.auto/`. The unit and integration test files were adapted to the new API but not re-run in this session.
+Earlier validation notes in commit `09e3d95` describe the former mandatory reviewer and holdout engine. Those notes are historical evidence for that implementation, not validation of the current advisor-only agent loop.

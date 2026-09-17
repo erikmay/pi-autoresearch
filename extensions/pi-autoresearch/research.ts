@@ -1,27 +1,28 @@
-/** Independent review and fresh ideation. No conversation messages enter these requests. */
+/** Outside advice and measured candidates. No conversation messages enter advisor requests. */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai";
 import { sessionFilePath } from "./paths.ts";
-
-export interface MetricRule {
-  name: string;
-  direction: "lower" | "higher";
-  maxRegressionPercent: number;
-}
 
 export interface ResearchConfig {
   objective: string;
   constraints: string[];
   sourceFiles: string[];
   evaluationFiles: string[];
-  validationMetrics: MetricRule[];
-  repetitions: number;
-  /** Consecutive failed experiments that close one approach. */
-  approachBudget: number;
+  failureInterval: number;
   timeoutSeconds: number;
+}
+
+/** Only measured outcomes and approach names enter the advisor's history. */
+export interface ResearchResult {
+  approach: string;
+  status: "keep" | "discard" | "crash" | "checks_failed";
+  metric: number | null;
+  metrics?: Record<string, number>;
+  checksPassed: boolean | null;
+  failure?: string;
 }
 
 export type Exec = (command: string, args: string[], options: {
@@ -95,82 +96,36 @@ function readConfig(file: string): ResearchConfig {
   if (evaluationFiles.some((f) => path.isAbsolute(f) || f.split(/[\\/]/).includes("..") || f.includes("\0") || sourceFiles.includes(f))) {
     throw new Error("evaluationFiles must be relative paths outside sourceFiles");
   }
-  if (!Array.isArray(v.validationMetrics) || !v.validationMetrics.length) throw new Error("validationMetrics must define independent holdout metrics");
-  const validationMetrics = v.validationMetrics.map((entry) => {
-    const r = object(entry);
-    const name = text(r.name);
-    if (!/^[\w.µ]+$/.test(name) || ["__proto__", "constructor", "prototype"].includes(name)) throw new Error("Invalid validation metric name");
-    if (r.direction !== "lower" && r.direction !== "higher") throw new Error("Invalid validation metric direction");
-    const tolerance = r.maxRegressionPercent ?? 0;
-    if (typeof tolerance !== "number" || !Number.isFinite(tolerance) || tolerance < 0 || tolerance > 100) throw new Error("Invalid regression tolerance");
-    return { name, direction: r.direction, maxRegressionPercent: tolerance } as MetricRule;
-  });
-  if (new Set(validationMetrics.map((r) => r.name)).size !== validationMetrics.length) throw new Error("Duplicate validation metrics");
   return {
-    objective: text(v.objective), constraints: strings(v.constraints ?? []), sourceFiles, evaluationFiles, validationMetrics,
-    repetitions: integer(v.repetitions, 3, 1, 9),
-    approachBudget: integer(v.approachBudget, 3, 1, 20),
+    objective: text(v.objective), constraints: strings(v.constraints ?? []), sourceFiles, evaluationFiles,
+    failureInterval: integer(v.failureInterval, 3, 1, 20),
     timeoutSeconds: integer(v.timeoutSeconds, 180, 1, 1800),
   };
 }
 
 export interface Snapshot {
-  head: string;
   files: Record<string, string | null>;
-  fileModes: Record<string, number | null>;
-  diff: string;
-  changedFiles: string[];
-  evaluationSource: Record<string, string>;
   fingerprint: string;
 }
 
-export interface Evidence {
-  id: string;
+interface Measurement {
   snapshot: Snapshot;
-  primary: number | null;
   primaryName: string;
-  benchmarkPassed: boolean;
-  benchmarkOutput: string;
-  checks?: { passed: boolean; output: string; durationSeconds: number };
-  validation: Record<string, number>;
-  validationOutput: string[];
-  validationPassed: boolean;
+  primary: number | null;
+  metrics: Record<string, number>;
+  passed: boolean;
+  checksPassed: boolean | null;
+  validationFailed: boolean;
   failure?: string;
-  review?: Review;
 }
 
-export interface Review {
-  accept: boolean;
-  reason: string;
-  overfittingRisks: string[];
-  requiredValidation: string[];
-}
-
-interface Approach {
-  attempts: number;
-  kept: number;
-  /** Failed experiments since the last keep. */
-  streak: number;
-  closed: boolean;
-}
-
-interface ResearchState {
-  version: 1;
-  contract: string;
-  reference: Record<string, number> | null;
-  baseline: Record<string, number> | null;
-  approaches: Record<string, Approach>;
-}
-
-/** One instance per session. Disk state restores the accepted holdout reference after restart. */
+/** One instance per session. The usual experiment log holds the advisor's history. */
 export class ResearchSession {
   readonly cwd: string;
   private exec: Exec;
   readonly config: ResearchConfig;
   private contract: string;
-  private state: ResearchState;
-  private stateText = "";
-  private evidence: Evidence | null = null;
+  private evidence: Measurement | null = null;
   private controller = new AbortController();
   private busy = false;
 
@@ -179,56 +134,22 @@ export class ResearchSession {
     this.exec = exec;
     this.config = readConfig(path.join(cwd, ".auto/research.json"));
     this.contract = this.contractFingerprint();
-    const file = path.join(cwd, ".auto/research-state.json");
-    if (fs.existsSync(file)) {
-      this.stateText = fs.readFileSync(file, "utf8");
-      const state = object(JSON.parse(this.stateText));
-      if (state.version !== 1 || state.contract !== this.contract) throw new Error("Research contract changed. Start a new research session explicitly.");
-      state.baseline ??= state.reference;
-      state.approaches = object(state.approaches ?? {});
-      for (const saved of [state.reference, state.baseline]) {
-        if (saved === null) continue;
-        const reference = object(saved);
-        for (const rule of this.config.validationMetrics) {
-          if (typeof reference[rule.name] !== "number" || !Number.isFinite(reference[rule.name])) throw new Error("Invalid saved holdout reference");
-        }
-      }
-      this.state = state as unknown as ResearchState;
-    } else {
-      this.state = { version: 1, contract: this.contract, reference: null, baseline: null, approaches: {} };
-      this.save();
-    }
   }
 
-  private save(): void {
-    this.stateText = JSON.stringify(this.state);
-    fs.writeFileSync(path.join(this.cwd, ".auto/research-state.json"), this.stateText);
-  }
-
-  /** Every experiment names its approach. A closed approach cannot be measured again. */
-  assertApproachOpen(name: unknown): string {
+  approachName(name: unknown): string {
+    if (name === undefined) return "unspecified";
     if (typeof name !== "string" || !APPROACH_NAME.test(name)) throw new Error("approach must be a short kebab-case name, for example field-order");
-    if (this.state.approaches[name]?.closed) throw new Error(`Approach "${name}" is closed. Choose an open approach from .auto/ideas.md or a genuinely different one.`);
     return name;
   }
 
-  /** Records one result. Returns true when this result closes the approach. */
-  recordApproach(name: string, kept: boolean): boolean {
-    this.assertContract();
-    const approach = this.state.approaches[name] ?? { attempts: 0, kept: 0, streak: 0, closed: false };
-    approach.attempts++;
-    if (kept) { approach.kept++; approach.streak = 0; } else approach.streak++;
-    approach.closed = approach.streak >= this.config.approachBudget;
-    this.state.approaches[name] = approach;
-    this.save();
-    return approach.closed;
+  /** Captured values take precedence over agent-supplied log metadata. */
+  measurement(): { metric: number | null; metrics: Record<string, number>; passed: boolean; checksPassed: boolean | null; validationFailed: boolean; failure?: string } {
+    if (!this.evidence) throw new Error("Log an experiment only after a fresh measurement");
+    const { primary, metrics, passed, checksPassed, validationFailed, failure } = this.evidence;
+    return { metric: primary, metrics: { ...metrics }, passed, checksPassed, validationFailed, ...(failure ? { failure } : {}) };
   }
 
-  approachSummary(): { open: string[]; closed: string[] } {
-    const describe = ([name, a]: [string, Approach]) => `${name} (${a.attempts} attempts, ${a.kept} kept)`;
-    const entries = Object.entries(this.state.approaches);
-    return { open: entries.filter(([, a]) => !a.closed).map(describe), closed: entries.filter(([, a]) => a.closed).map(describe) };
-  }
+  consume(): void { this.evidence = null; }
 
   cancel(): void { this.controller.abort(); this.evidence = null; }
 
@@ -252,10 +173,10 @@ export class ResearchSession {
   }
 
   private contractFingerprint(): string {
-    const paths = [".auto/research.json", ".auto/holdout.sh", sessionFilePath(this.cwd, "measure"), sessionFilePath(this.cwd, "checks"), sessionFilePath(this.cwd, "config"), ...this.config.evaluationFiles];
+    const paths = [".auto/research.json", sessionFilePath(this.cwd, "measure"), sessionFilePath(this.cwd, "checks"), sessionFilePath(this.cwd, "config"), ...this.config.evaluationFiles];
     return hash(JSON.stringify(paths.map((p) => {
       const file = path.resolve(this.cwd, p);
-      if ((p === ".auto/holdout.sh" || this.config.evaluationFiles.includes(p)) && !fs.existsSync(file)) throw new Error(`Missing independent evaluation file: ${p}`);
+      if (this.config.evaluationFiles.includes(p) && !fs.existsSync(file)) throw new Error(`Missing independent evaluation file: ${p}`);
       return [p, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null];
     })));
   }
@@ -263,7 +184,6 @@ export class ResearchSession {
   assertContract(): void {
     if (this.controller.signal.aborted) throw new Error("Research session was stopped");
     if (this.contractFingerprint() !== this.contract) throw new Error("Protected research config or evaluation script changed");
-    if (fs.readFileSync(path.join(this.cwd, ".auto/research-state.json"), "utf8") !== this.stateText) throw new Error("Saved holdout reference changed during the session");
   }
 
   private async git(args: string[], signal?: AbortSignal): Promise<string> {
@@ -292,15 +212,9 @@ export class ResearchSession {
       files[name] = data.toString("utf8");
       fileModes[name] = fs.statSync(file).mode & 0o777;
     }
-    const diff = await this.git(["diff", "HEAD", "--", ...this.config.sourceFiles], signal);
-    const evaluationSource: Record<string, string> = Object.create(null);
-    for (const file of [sessionFilePath(this.cwd, "measure"), sessionFilePath(this.cwd, "checks"), path.join(this.cwd, ".auto/holdout.sh"), ...this.config.evaluationFiles.map((f) => path.join(this.cwd, f))]) {
-      if (fs.existsSync(file)) evaluationSource[path.relative(this.cwd, file)] = fs.readFileSync(file, "utf8");
-    }
-    const payload = JSON.stringify({ head, files, fileModes, changedFiles, evaluationSource });
-    if (Buffer.byteLength(payload) + Buffer.byteLength(diff) > MAX_SNAPSHOT_BYTES) throw new Error("Source snapshot exceeds 200 KiB; narrow sourceFiles explicitly");
-    // Staging a new file changes the diff representation, but not the measured source.
-    return { head, files, fileModes, diff, changedFiles, evaluationSource, fingerprint: hash(payload) };
+    const payload = JSON.stringify({ head, files, fileModes, changedFiles });
+    if (Buffer.byteLength(payload) > MAX_SNAPSHOT_BYTES) throw new Error("Source snapshot exceeds 200 KiB; narrow sourceFiles explicitly");
+    return { files, fingerprint: hash(payload) };
   }
 
   async begin(signal?: AbortSignal): Promise<Snapshot> {
@@ -308,123 +222,78 @@ export class ResearchSession {
     return this.snapshot(signal);
   }
 
-  async measure(snapshot: Snapshot, primaryName: string, primary: number | null, passed: boolean, output: string, signal?: AbortSignal, totalOutputBytes = Buffer.byteLength(output), checks?: Evidence["checks"]): Promise<Evidence> {
-    const evidence: Evidence = {
-      id: randomUUID(), snapshot, primaryName, primary, benchmarkPassed: passed,
-      benchmarkOutput: output.slice(-MAX_OUTPUT_BYTES), validation: {}, validationOutput: [], validationPassed: false,
-      checks: checks ? { ...checks } : undefined,
-    };
+  async measure(snapshot: Snapshot, primaryName: string, primary: number | null, benchmarkPassed: boolean, output: string, signal?: AbortSignal, totalOutputBytes = Buffer.byteLength(output), checks?: { passed: boolean; output?: string }, timedOut = false, metrics: Record<string, number> = {}): Promise<Measurement> {
+    const evidence: Measurement = { snapshot, primaryName, primary: benchmarkPassed ? primary : null, metrics: Object.fromEntries(Object.entries(metrics).filter(([name, value]) => name !== primaryName && Number.isFinite(value))), passed: benchmarkPassed, checksPassed: checks?.passed ?? null, validationFailed: false };
     this.evidence = evidence;
     try {
+      // Checks intentionally do not run after a failed benchmark. Preserve its actual failure first.
+      if (!benchmarkPassed) {
+        const validation = !timedOut && output.match(/^VALIDATION_FAILED[ \t]+(.+)$/m);
+        evidence.validationFailed = Boolean(validation);
+        const reason = timedOut ? "Benchmark timed out" : validation ? `Validation failed: ${validation[1]!.trim()}` : "Benchmark failed";
+        throw new Error(`${reason}${output.trim() ? "\n" + output.trim().slice(-2000) : ""}`);
+      }
+      if (primary === null || !Number.isFinite(primary)) throw new Error("A successful benchmark with a structured primary METRIC is required");
       if (fs.existsSync(sessionFilePath(this.cwd, "checks")) && !checks) throw new Error("Missing measured checks evidence");
-      if (checks && (!checks.passed || Buffer.byteLength(checks.output) > MAX_OUTPUT_BYTES)) throw new Error("Checks failed or checks output exceeds 32 KiB");
-      if (!passed || primary === null || !Number.isFinite(primary)) throw new Error("A successful benchmark with a structured primary METRIC is required");
-      const primaryLines = [...output.matchAll(/^METRIC\s+([\w.µ]+)=(\S+)\s*$/gm)].filter((m) => m[1] === primaryName);
-      if (primaryLines.length !== 1 || Number(primaryLines[0][2]) !== primary) throw new Error("Primary metric must occur exactly once in benchmark output");
+      if (checks && !checks.passed) throw new Error(`Checks failed${checks.output ? "\n" + checks.output.slice(-2000) : ""}`);
+      const lines = [...output.matchAll(/^METRIC\s+([\w.µ]+)=(\S+)\s*$/gm)].filter((m) => m[1] === primaryName);
+      if (lines.length !== 1 || Number(lines[0][2]) !== primary) throw new Error("Primary metric must occur exactly once in benchmark output");
       if (totalOutputBytes > MAX_OUTPUT_BYTES) throw new Error("Benchmark output exceeds 32 KiB; reduce output explicitly");
-      if ((await this.snapshot(signal)).fingerprint !== snapshot.fingerprint) throw new Error("Source changed while measuring");
-      const values = new Map(this.config.validationMetrics.map((r) => [r.name, [] as number[]]));
-      for (let i = 0; i < this.config.repetitions; i++) {
-        const r = await this.exec("bash", [path.join(this.cwd, ".auto/holdout.sh")], { cwd: this.cwd, timeout: this.config.timeoutSeconds * 1000, signal: this.signal(signal) });
-        const raw = r.stdout + "\n" + r.stderr;
-        if (Buffer.byteLength(raw) > MAX_OUTPUT_BYTES) throw new Error("Holdout output exceeds 32 KiB");
-        evidence.validationOutput.push(raw);
-        if (r.code !== 0 || r.killed) throw new Error("Independent holdout validation failed");
-        for (const rule of this.config.validationMetrics) {
-          const matches = [...r.stdout.matchAll(/^METRIC\s+([\w.µ]+)=(\S+)\s*$/gm)].filter((m) => m[1] === rule.name);
-          if (matches.length !== 1 || !Number.isFinite(Number(matches[0][2]))) throw new Error(`Missing or duplicate holdout metric: ${rule.name}`);
-          values.get(rule.name)!.push(Number(matches[0][2]));
-        }
-      }
-      for (const [name, samples] of values) {
-        samples.sort((a, b) => a - b);
-        const mid = Math.floor(samples.length / 2);
-        evidence.validation[name] = samples.length % 2 ? samples[mid] : (samples[mid - 1] + samples[mid]) / 2;
-      }
-      if ((await this.snapshot(signal)).fingerprint !== snapshot.fingerprint) throw new Error("Source changed during holdout validation");
-      evidence.validationPassed = true;
+      await this.assertMeasuredSnapshot(signal);
     } catch (error) {
+      evidence.passed = false;
       evidence.failure = error instanceof Error ? error.message : String(error);
     }
     return evidence;
   }
 
-  async review(primary: number, call: ModelCall, signal?: AbortSignal, primaryContext?: { name: string; direction: "lower" | "higher"; reference: number | null }): Promise<{ evidence: Evidence; review: Review }> {
-    if (this.busy) throw new Error("Research operation already running");
+  async assertCanKeep(primary: number, primaryName: string, signal?: AbortSignal): Promise<void> {
     const e = this.evidence;
     if (!e) throw new Error("Cannot keep without fresh measured research evidence");
-    this.assertContract();
     if (primary !== e.primary) throw new Error("Logged primary metric differs from measured evidence");
-    if (primaryContext && primaryContext.name !== e.primaryName) throw new Error("Measured primary metric belongs to a different optimization target");
-    if ((await this.snapshot(signal)).fingerprint !== e.snapshot.fingerprint) throw new Error("Source changed after measurement; run the experiment again");
-    const reject = (reason: string): Review => ({ accept: false, reason, overfittingRisks: [], requiredValidation: [] });
-    if (!e.benchmarkPassed || !e.validationPassed) e.review = reject(e.failure ?? "Measurement failed");
-    // Committed code with no diff is the baseline. It only needs measured evidence, not a model opinion.
-    else if (!this.state.reference && !e.snapshot.changedFiles.length) e.review = { accept: true, reason: "Unchanged baseline established from measured evidence.", overfittingRisks: [], requiredValidation: [] };
-    for (const reference of [this.state.reference, this.state.baseline]) {
-      if (e.review || !reference) continue;
-      for (const rule of this.config.validationMetrics) {
-        const previous = reference[rule.name];
-        const tolerance = Math.abs(previous) * rule.maxRegressionPercent / 100;
-        const regression = rule.direction === "lower" ? e.validation[rule.name] - previous : previous - e.validation[rule.name];
-        if (regression > tolerance) { e.review = reject(`Holdout regression in ${rule.name}: ${previous} → ${e.validation[rule.name]}`); break; }
-      }
-    }
-    if (!e.review) {
-      this.busy = true;
-      try {
-        const raw = await this.invoke(call, CONSULTANT_MODEL,
-          `You are an independent experiment evaluator. ${DATA_RULE} Assess correctness, generalization, benchmark special cases, hidden tradeoffs, and whether validation supports this change. Missing evidence means reject. Return {"accept":boolean,"reason":string,"overfittingRisks":string[],"requiredValidation":string[]}. Accept only when requiredValidation is empty.`,
-          { objective: this.config.objective, constraints: this.config.constraints, source: e.snapshot.files, diff: e.snapshot.diff, evaluationSource: e.snapshot.evaluationSource,
-            benchmark: { name: e.primaryName, measured: e.primary, direction: primaryContext?.direction, reference: primaryContext?.reference, passed: e.benchmarkPassed, output: e.benchmarkOutput },
-            checks: e.checks ?? null,
-            holdoutRules: this.config.validationMetrics, holdoutReference: this.state.reference, holdoutBaseline: this.state.baseline,
-            holdout: { passed: e.validationPassed, medians: e.validation, outputs: e.validationOutput } }, signal);
-        const r = object(JSON.parse(raw));
-        if (typeof r.accept !== "boolean") throw new Error("Review accept must be boolean");
-        const review = { accept: r.accept, reason: text(r.reason), overfittingRisks: strings(r.overfittingRisks), requiredValidation: strings(r.requiredValidation) };
-        if (review.requiredValidation.length) review.accept = false;
-        e.review = review;
-      } catch (error) {
-        e.review = reject(`Evaluator unavailable or invalid: ${error instanceof Error ? error.message : String(error)}`);
-      } finally { this.busy = false; }
-    }
-    this.assertContract();
-    if (signal?.aborted || (await this.snapshot(signal)).fingerprint !== e.snapshot.fingerprint) throw new Error("Review cancelled or source changed during evaluation");
-    this.append("reviews", { model: CONSULTANT_MODEL, ...e });
-    return { evidence: e, review: e.review! };
+    if (primaryName !== e.primaryName) throw new Error("Measured primary metric belongs to a different optimization target");
+    if (!e.passed) throw new Error(e.failure ?? "Measurement failed");
+    await this.assertMeasuredSnapshot(signal);
   }
 
-  consume(accepted: boolean): void {
-    if (accepted) {
-      this.assertContract();
-      if (!this.evidence?.review?.accept) throw new Error("Missing independent acceptance");
-      this.state.reference = { ...this.evidence.validation };
-      this.state.baseline ??= { ...this.evidence.validation };
-      this.save();
-    }
-    this.evidence = null;
-  }
-
-  async assertReviewedSnapshot(signal?: AbortSignal): Promise<void> {
-    if (!this.evidence?.review?.accept || (await this.snapshot(signal)).fingerprint !== this.evidence.snapshot.fingerprint) {
-      throw new Error("Independent approval no longer matches the code being committed");
+  async assertMeasuredSnapshot(signal?: AbortSignal): Promise<void> {
+    if (!this.evidence) throw new Error("Cannot keep without fresh measured research evidence");
+    if ((await this.snapshot(signal)).fingerprint !== this.evidence.snapshot.fingerprint) {
+      this.evidence.passed = false;
+      this.evidence.failure = "Source changed after measurement; run the experiment again";
+      throw new Error(this.evidence.failure);
     }
   }
 
-  /**
-   * One outside request at a turning point. The advisor sees the objective, the source, and which
-   * approaches are open or closed with their attempt counts. It never sees the log, the backlog, or
-   * experimenter notes. It either proposes new approaches or tells the loop to stop.
-   */
-  async ideate(call: ModelCall, signal?: AbortSignal): Promise<{ text: string; stop: boolean }> {
+  /** Fresh advice uses the current source and measured experiment history. */
+  async ideate(call: ModelCall, results: ResearchResult[], primary: { name: string; direction: "lower" | "higher" }, signal?: AbortSignal): Promise<{ text: string; stop: boolean }> {
     if (this.busy) throw new Error("Research operation already running");
     this.busy = true;
     try {
       const snapshot = await this.snapshot(signal);
-      const approaches = this.approachSummary();
-      const data = { objective: this.config.objective, constraints: this.config.constraints, source: snapshot.files, approaches };
-      const system = `You are an outside research advisor. ${DATA_RULE} Closed approaches were tried and failed; open approaches are in progress with the shown attempt counts. Decide whether continuing is worthwhile. If the objective looks exhausted for this source, or the attempts show aimless variation, return verdict "stop" with a reason and an empty ideas list. Otherwise return verdict "continue" with three to five genuinely different approaches that do not overlap with any listed approach. Prefer changes to the algorithm, data layout, or removed work over micro-tuning. Each idea needs an approach name (kebab-case, two to four words), a falsifiable hypothesis, a concrete change, a mechanism, and a validation plan. Keep each field to one short sentence. Return {"verdict":"continue"|"stop","reason":string,"ideas":[{"approach":string,"hypothesis":string,"change":string,"mechanism":string,"validation":string}]}.`;
+      const approaches = new Map<string, { attempts: number; kept: number; bestKeptMetric: number | null; lastResult: ResearchResult }>();
+      for (const result of results) {
+        const summary = approaches.get(result.approach) ?? { attempts: 0, kept: 0, bestKeptMetric: null, lastResult: result };
+        summary.attempts++;
+        summary.lastResult = result;
+        if (result.status === "keep") {
+          summary.kept++;
+          if (result.metric !== null && (summary.bestKeptMetric === null || (primary.direction === "lower" ? result.metric < summary.bestKeptMetric : result.metric > summary.bestKeptMetric))) summary.bestKeptMetric = result.metric;
+        }
+        approaches.set(result.approach, summary);
+      }
+      const kept = results.filter((r) => r.status === "keep" && r.metric !== null);
+      const metrics = kept.map((r) => r.metric!);
+      const bestResult = kept.reduce<ResearchResult | null>((best, result) => !best || (primary.direction === "lower" ? result.metric! < best.metric! : result.metric! > best.metric!) ? result : best, null);
+      const data = {
+        objective: this.config.objective, constraints: this.config.constraints, source: snapshot.files,
+        primary: { ...primary, baseline: kept[0]?.metric ?? null, best: metrics.length ? (primary.direction === "lower" ? Math.min(...metrics) : Math.max(...metrics)) : null },
+        baselineResult: kept[0] ?? null, bestResult,
+        approaches: Array.from(approaches, ([name, summary]) => ({ name, ...summary })), recentResults: results.slice(-20),
+      };
+      if (Buffer.byteLength(JSON.stringify(data)) > MAX_SNAPSHOT_BYTES) throw new Error("Advisor context exceeds 200 KiB");
+      const system = `You are an outside research advisor. ${DATA_RULE} Use measured outcomes to decide whether continuing is worthwhile. Compare the primary gain with measured secondary costs, including latency, memory, and errors, and with added source complexity. A hard constraint is a ceiling, not proof that a tradeoff is worthwhile. A small primary gain with a large cost increase can justify stopping. Prefer a concrete way to remove that cost over further costly recovery variants. If secondary evidence is missing, state that uncertainty; do not assume headroom. Explain the benefit and cost behind your verdict. Failed validation is evidence against a candidate even when it produced no timing. Do not confuse validation rejection with broken measurement infrastructure. Revisit an approach only when the proposed change addresses its previous failure. Approach names are labels, not hard boundaries. Distinguish useful variants from repeated unproductive tuning. If the objective looks exhausted or no useful direction remains, return verdict "stop" with a reason and an empty ideas list. Otherwise return verdict "continue" with one to three concrete suggestions. Explain what should change relative to prior attempts. Prefer changes to algorithms, data layout, or removed work over micro-tuning. Each idea needs an approach name (short kebab-case), a falsifiable hypothesis, a concrete change, a mechanism, and a validation plan. Keep each field to one short sentence. Return {"verdict":"continue"|"stop","reason":string,"ideas":[{"approach":string,"hypothesis":string,"change":string,"mechanism":string,"validation":string}]}.`;
+
       let response: Record<string, unknown>;
       try {
         response = object(JSON.parse(await this.invoke(call, CONSULTANT_MODEL, system, data, signal)));
@@ -433,27 +302,24 @@ export class ResearchSession {
         if (!(error instanceof SyntaxError)) throw error;
         response = object(JSON.parse(await this.invoke(call, CONSULTANT_MODEL, system + " Ensure valid JSON with escaped strings and no trailing commas.", data, signal)));
       }
+      if (response.verdict !== "stop" && response.verdict !== "continue") throw new Error("Invalid advisor verdict");
       const stop = response.verdict === "stop";
       const reason = text(response.reason);
-      if (!Array.isArray(response.ideas) || response.ideas.length > 5 || (!stop && !response.ideas.length)) throw new Error("Invalid ideas response");
-      const known = new Set(Object.keys(this.state.approaches));
+      if (!Array.isArray(response.ideas) || response.ideas.length > 3 || (stop ? response.ideas.length !== 0 : !response.ideas.length)) throw new Error("Invalid ideas response");
       const ideas = (response.ideas as unknown[]).map((value) => {
         const idea = object(value);
         const approach = text(idea.approach).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
         if (!APPROACH_NAME.test(approach)) throw new Error("Invalid approach name in ideas response");
         return { approach, hypothesis: text(idea.hypothesis), change: text(idea.change), mechanism: text(idea.mechanism), validation: text(idea.validation) };
-      }).filter((idea) => !known.has(idea.approach));
+      });
       this.assertContract();
       if (signal?.aborted || (await this.snapshot(signal)).fingerprint !== snapshot.fingerprint) throw new Error("Ideation cancelled or source changed");
-      this.append("ideation", { fingerprint: snapshot.fingerprint, model: CONSULTANT_MODEL, approaches, verdict: stop ? "stop" : "continue", reason, ideas });
+      this.append("ideation", { fingerprint: snapshot.fingerprint, model: CONSULTANT_MODEL, primary: data.primary, baselineResult: data.baselineResult, bestResult: data.bestResult, approaches: data.approaches, recentResults: data.recentResults, verdict: stop ? "stop" : "continue", reason, ideas });
       if (stop) return { text: `The outside advisor recommends stopping: ${reason}`, stop: true };
-      if (!ideas.length) throw new Error("The advisor proposed no new approaches");
       const backlogFile = sessionFilePath(this.cwd, "ideas");
-      const backlog = fs.existsSync(backlogFile) ? fs.readFileSync(backlogFile, "utf8") : "";
-      const unique = ideas.filter((i) => !backlog.includes(i.change));
-      const bullets = unique.map((i) => `- [ ] Approach: ${i.approach} | ${i.hypothesis} | Change: ${i.change} | Mechanism: ${i.mechanism} | Validate: ${i.validation}`);
-      if (bullets.length) fs.appendFileSync(backlogFile, "\n" + bullets.join("\n") + "\n");
-      return { text: `The outside advisor proposed ${unique.length} new approaches in .auto/ideas.md. Pick one open approach and pass its name as the approach parameter.`, stop: false };
+      const bullets = ideas.map((i) => `- [ ] Approach: ${i.approach} | ${i.hypothesis} | Change: ${i.change} | Mechanism: ${i.mechanism} | Validate: ${i.validation}`);
+      fs.appendFileSync(backlogFile, "\n" + bullets.join("\n") + "\n");
+      return { text: `The outside advisor proposed ${ideas.length} suggestions in .auto/ideas.md: ${reason}. Choose a useful next experiment and use its approach name.`, stop: false };
     } finally { this.busy = false; }
   }
 

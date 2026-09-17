@@ -1,15 +1,12 @@
-# Independent review and an outside advisor
+# Outside research advisor
 
-Independent mode adds two outside authorities to the experiment loop. Both use `openai-codex/gpt-6-astra`; the experimenter model must differ.
+The research agent runs experiments. A separate advisor helps it choose useful directions and decide when to stop. The advisor uses `openai-codex/gpt-6-astra`; the experimenter model must differ.
 
-- A reviewer checks each candidate `keep` against frozen evidence before it is committed.
-- An advisor is consulted at turning points. It proposes genuinely new approaches or tells the loop to stop.
-
-Enable it with `.auto/research.json`. Sessions without this file keep their usual behavior.
+Enable the advisor with `.auto/research.json`. Sessions without this file keep their usual behavior.
 
 ## Setup
 
-Create the usual `.auto/measure.sh`, then create `.auto/holdout.sh`. The holdout script must check correctness on inputs different from the optimization benchmark, exit nonzero on failure, and emit each configured validation metric exactly once as `METRIC name=number`.
+Create the usual `.auto/measure.sh` and put correctness checks in `.auto/checks.sh`. Then add:
 
 ```json
 {
@@ -19,77 +16,67 @@ Create the usual `.auto/measure.sh`, then create `.auto/holdout.sh`. The holdout
     "Do not special-case benchmark fixtures."
   ],
   "sourceFiles": ["src/parser.ts"],
-  "evaluationFiles": [".auto/measure.ts", ".auto/holdout.ts", "fixtures/validation.json"],
-  "validationMetrics": [
-    { "name": "validation_ms", "direction": "lower", "maxRegressionPercent": 2 }
-  ],
-  "repetitions": 3,
-  "approachBudget": 3,
+  "evaluationFiles": [".auto/measure.ts", ".auto/checks.ts", "fixtures/validation.json"],
+  "failureInterval": 3,
   "timeoutSeconds": 180
 }
 ```
 
-`sourceFiles` contains the production source the agent may change and all source needed for review. Changes to other production files block the experiment. `evaluationFiles` contains helper scripts and data used by measurement or validation. Include every such dependency: freezing a shell wrapper does not freeze a helper it imports. Evaluation files must not overlap production source files.
+`sourceFiles` lists the production files the agent may change and the source the advisor needs. Changes to other production files block measurement. `evaluationFiles` lists benchmark and correctness-check helpers and data. Include their dependencies; freezing a shell wrapper does not freeze imported helpers. Source files and evaluation files must not overlap.
 
-`approachBudget` is the number of failed experiments in a row that close one approach (default 3). Unknown keys are ignored.
+Configuration, measurement scripts, correctness scripts, and listed evaluation files stay fixed while the research session is active. Stop the loop before changing them.
 
-Run the benchmark as `bash .auto/measure.sh`. Independent mode executes this script directly and rejects arguments, environment prefixes, pipes, redirection, and chained commands.
+Run the benchmark as `bash .auto/measure.sh`. Advisor mode executes this script directly and rejects arguments, environment prefixes, pipes, redirection, and chained commands. The primary metric must appear exactly once as `METRIC name=number`.
 
-Start the session with `/autoresearch <goal>`. `/autoresearch ideas` consults the advisor on demand. API calls use Pi's configured providers and authentication.
+If validation inside the benchmark rejects a candidate, print `VALIDATION_FAILED <reason>` on its own line and exit nonzero. The extension records this as `checks_failed`, even if the experimenter proposes `crash`. Other nonzero benchmark exits remain crashes. Skipped checks after a failed benchmark are expected; the actual benchmark output is captured as the failure reason. Timeouts remain benchmark failures even if earlier output contains a validation marker.
 
-## Approaches
+Keep stderr and failure diagnostics visible in `.auto/checks.sh`. Redirecting build output to `/dev/null` can hide compiler or lint errors from both the experimenter and advisor.
 
-Every `run_experiment` names its approach: a short kebab-case name for the idea family the experiment belongs to, for example `field-order`. The unchanged baseline uses `baseline`. Variants of one idea share one name.
+Start with `/autoresearch <goal>`. Use `/autoresearch ideas` to ask for advice on demand. Requests use Pi's configured providers and authentication.
 
-An approach closes after `approachBudget` failed experiments in a row. A closed approach is rejected before the benchmark runs. This is what ends an idea that stopped paying off: the experimenter cannot keep tuning it. The system prompt tells the agent not to rename an exhausted idea.
+## Advice
 
-Approach counters live in `.auto/research-state.json` and survive restarts. Every log entry records its approach in `asi.approach`.
+The advisor is consulted after the first accepted baseline, after every `failureInterval` unsuccessful experiments in a row, and on manual request. The default interval is three. Discards, crashes, and failed correctness checks all count. A keep resets the failure streak.
 
-## Acceptance
+Each request starts fresh with no conversation history and no model tools. The advisor receives:
 
-The first accepted run establishes the baseline. When the source has no changes against HEAD, the baseline needs measured evidence and a passing holdout but no model review.
+- The objective, constraints, and current source.
+- The primary metric, direction, baseline, and best accepted result.
+- Baseline and best accepted outcomes with secondary metrics captured directly from benchmark `METRIC` lines. Agent-supplied secondary log values are not used as measured advisor evidence. Older outcomes without captured secondary metrics leave those values unknown.
+- Attempt counts, keep counts, best accepted metric, and latest result for each approach.
+- The last 20 experiment outcomes with captured metrics, correctness-check results, and actual failure diagnostics. Failed validation remains evidence against an approach even when no timing was produced.
 
-Later candidates must improve the primary metric over the best accepted run. Validation runs repeat independently and report the median of each metric. A regression beyond its tolerance rejects the candidate before a model request. Validation is compared with both the last accepted result and the original baseline, so small tolerated regressions cannot accumulate.
+It does not receive the experimenter's hypotheses, self-evaluation, conversation, ideas backlog, or evaluation source. Independence comes from a fresh request, while measured outcomes provide the information needed for useful advice.
 
-Only then does the reviewer see the candidate. It receives the objective, constraints, source snapshot, code diff, frozen evaluation files, captured benchmark output, checks evidence, and validation evidence. It does not receive the experimenter's descriptions, hypotheses, or conversation messages. Each request starts with a fresh message array and no tools.
+The advisor weighs primary gains against measured secondary costs and added source complexity. Meeting a hard constraint does not make a tradeoff worthwhile. A small gain with a large latency increase can justify stopping; a specific proposal to remove that cost can justify continuing. Missing secondary evidence must remain explicit uncertainty.
 
-A rejection converts the proposed `keep` into `discard` and restores the production source and Git index. Missing validation, provider errors, timeouts, invalid JSON, incomplete responses, or outstanding required validation cannot produce acceptance. Changed source, changed evaluation scripts, fabricated logged metrics, and reuse of consumed evidence block acceptance. When `.auto/checks.sh` exists, failed or missing checks evidence blocks acceptance.
+Use an optional short kebab-case `approach` name in `run_experiment`, such as `field-order`. Variants should share a name. Missing names use `unspecified`. Names serve as memory; no approach is locked. The advisor can suggest a useful variant of a previous idea.
 
-## Advisor
+`continue` returns one to three concrete suggestions with a hypothesis, change, mechanism, and validation plan. The extension appends them to `.auto/ideas.md`. `stop` disables the experiment tools and automatic continuation, whether requested automatically or through `/autoresearch ideas`. The agent can then report the accepted result.
 
-The advisor is consulted:
+Malformed JSON gets one fresh bounded retry. Provider errors, timeouts, and invalid responses are reported and leave the loop running. `timeoutSeconds` applies to each advisor request. Use `.auto/config.json` with `maxIterations` if a hard experiment limit is needed. Advisor mode does not use the usual 200-turn or consecutive-discard auto-resume limits.
 
-- once after the baseline,
-- whenever an approach closes,
-- after every `approachBudget` failed experiments in a row across approaches.
+## Acceptance and records
 
-It receives the objective, constraints, current source, and the list of open and closed approach names with attempt and keep counts. It never receives the log, the ideas backlog, holdout outputs, or conversation history.
+There is no model review for each keep and no separate holdout-reference state. A keep requires fresh measured evidence, an unchanged source snapshot, passing correctness checks when `.auto/checks.sh` exists, and a primary improvement over the best accepted run. The baseline only needs fresh successful measurement. Claimed metrics cannot replace captured values, and consumed measurements cannot be reused.
 
-It returns one of two verdicts. `continue` comes with three to five approaches that do not overlap with any listed one; the extension appends them as `- [ ] Approach: <name> | ...` lines to `.auto/ideas.md` and drops proposals whose name is already known. `stop` ends the loop with a reason. This is the only planned stop in independent mode: there is no iteration cap unless `.auto/config.json` sets one.
+Keeps commit the measured candidate. Discards, crashes, and correctness failures restore production source and the Git index. A failed restore stops advisor mode instead of continuing with rejected code.
 
-Malformed JSON gets one fresh bounded retry. Advisor failures leave the loop running and are reported in the tool result.
+The usual `.auto/log.jsonl` records approach names and captured evidence in `asi.research_measurement`. It also restores experiment history after restart. `.auto/ideation.jsonl` records advisor inputs and decisions. No extra research-state file is required.
 
-## Evidence and limits
+Older `approachBudget`, `validationMetrics`, and `repetitions` settings are no longer used. Move any required `.auto/holdout.sh` checks into `.auto/checks.sh` and set `failureInterval` for advice frequency. Old review journals and research-state files are historical records and are not read.
 
-`.auto/reviews.jsonl` records reviewer decisions and measured evidence. `.auto/ideation.jsonl` records each advisor consultation with the approach summary, verdict, reason, and proposals. `asi.independent_review` links each reviewed experiment to its evidence ID and source fingerprint.
+The advisor is guidance, not a correctness proof or a filesystem sandbox. Use representative correctness checks during research and a separate final evaluation before accepting the overall result. Source plus advisor history must fit within 200 KiB; benchmark output and advisor responses must fit within 32 KiB.
 
-An independent model can detect correctness gaps and benchmark special cases missed by a small validation set. It cannot prove generalization. Keep a separate final evaluation dataset outside the loop and evaluate the final candidate once before accepting the overall result.
-
-Isolation here means separate model requests with no conversation history and no model tools. It is not an operating-system sandbox for the experimenter. Do not treat the model as a security boundary against a hostile process with filesystem access.
-
-The complete source and evaluation snapshot must fit within 200 KiB. Benchmark output, each validation output, and model responses must fit within 32 KiB. Oversized evidence blocks acceptance rather than silently truncating the review. The timeout applies to each model request and validation invocation.
-
-The research contract and accepted validation reference survive restarts in `.auto/research-state.json`. `off` cancels research requests and keeps the saved reference. To change the objective, metric, scope, or evaluation rules, stop the loop, archive `.auto`, and create a new session.
-
-## Run the live example
-
-The example makes real model requests and retains its temporary repository and reports:
+## Example
 
 ```sh
 pnpm install --frozen-lockfile
 bun examples/independent-research/validate.ts
 ```
 
-Override the executing model with `RESEARCH_EXPERIMENTER`. For a complete interactive loop, run `bun examples/independent-research/validate.ts --prepare-agent`, start Pi in the printed directory with this extension and its skills loaded, then run `/autoresearch optimize generic duplicate counting`. The loop runs until the advisor stops it.
+This driver uses real advisor requests and preserves its temporary repository and reports. Set `RESEARCH_EXPERIMENTER` to change the executing model.
 
-After the loop, run `bun examples/independent-research/final-evaluation.ts <example-directory>` to check new input distributions outside the loop.
+For an interactive loop, run `bun examples/independent-research/validate.ts --prepare-agent`, start Pi in the printed directory with this extension and its skills loaded, then run `/autoresearch optimize generic duplicate counting`.
+
+After the loop, run `bun examples/independent-research/final-evaluation.ts <example-directory>` to evaluate correctness and timing on additional input distributions outside the optimization loop.
