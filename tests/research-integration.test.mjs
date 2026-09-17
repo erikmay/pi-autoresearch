@@ -25,7 +25,7 @@ async function harness(t, maxIterations = 10, extraSources = []) {
   write(".auto/measure.sh", '. ./source.sh\nprintf "METRIC time=%s\\n" "$PRIMARY"\n');
   write(".auto/holdout.sh", '. ./source.sh\nprintf "METRIC validation=%s\\n" "$HOLDOUT"\n');
   write(".auto/config.json", JSON.stringify({ maxIterations }));
-  write(".auto/research.json", JSON.stringify({ objective: "Improve generic execution time.", sourceFiles: ["source.sh", ...extraSources], reviewModel: "fake/reviewer", ideaModels: ["fake/ideas"], validationMetrics: [{ name: "validation", direction: "lower" }], repetitions: 1 }));
+  write(".auto/research.json", JSON.stringify({ objective: "Improve generic execution time.", sourceFiles: ["source.sh", ...extraSources], reviewModel: "openai-codex/gpt-6-astra", ideaModels: ["openai-codex/gpt-6-astra"], validationMetrics: [{ name: "validation", direction: "lower" }], repetitions: 1 }));
   for (const args of [["init", "-q"], ["config", "user.email", "test@example.invalid"], ["config", "user.name", "Research Test"], ["add", "."], ["commit", "-qm", "Baseline"]]) {
     assert.equal((await exec("git", args, { cwd })).code, 0);
   }
@@ -71,7 +71,8 @@ test("independent acceptance commits actual code, captures review, and triggers 
   await f.run();
   const baseline = await f.log(100);
   assert.equal(baseline.details.experiment.status, "keep");
-  assert.ok(f.calls.some((c) => c.model === "fake/ideas"));
+  assert.ok(f.calls.some((c) => c.context.systemPrompt.includes("ideation agent")));
+  assert.ok(f.calls.every((c) => c.model === "openai-codex/gpt-6-astra"));
   f.write("source.sh", "PRIMARY=50\nHOLDOUT=50\n");
   await f.run();
   const result = await f.log(50);
@@ -114,9 +115,9 @@ test("spoofed metrics, stale code, changed contract, and matching reviewer model
   f.write("source.sh", "PRIMARY=90\nHOLDOUT=90\n");
   assert.equal((await f.log(100)).isError, true);
   await f.run();
-  f.ctx.model.id = "reviewer";
+  f.ctx.model = { provider: "openai-codex", id: "gpt-6-astra" };
   assert.equal((await f.log(90)).isError, true);
-  f.ctx.model.id = "experimenter";
+  f.ctx.model = { provider: "fake", id: "experimenter" };
   f.write(".auto/research.json", "{}");
   assert.equal((await f.log(90)).isError, true);
   assert.equal(fs.readFileSync(path.join(f.cwd, ".auto/log.jsonl"), "utf8").split("\n").filter(Boolean).length, 1);

@@ -11,7 +11,7 @@ Enable it with `.auto/research.json`. Existing sessions without this file retain
 
 Create the usual `.auto/measure.sh`, then create `.auto/holdout.sh`. The holdout script must check correctness on inputs different from the optimization benchmark, exit nonzero on failure, and emit each configured validation metric exactly once as `METRIC name=number`.
 
-Use explicit reasoning model IDs available in your Pi installation. The reviewer model must differ from the active experimenter model. For example, when the experimenter uses `openai-codex/gpt-5.6-sol`:
+All external consultants use `openai-codex/gpt-6-astra`. Other consultant model IDs are rejected before requests are sent. The reviewer model must differ from the active experimenter model. For example, when the experimenter uses `openai-codex/gpt-5.6-sol`:
 
 ```json
 {
@@ -22,8 +22,8 @@ Use explicit reasoning model IDs available in your Pi installation. The reviewer
   ],
   "sourceFiles": ["src/parser.ts"],
   "evaluationFiles": [".auto/measure.ts", ".auto/holdout.ts", "fixtures/validation.json"],
-  "reviewModel": "openai-codex/gpt-5.5",
-  "ideaModels": ["openai-codex/gpt-6-astra", "openai-codex/gpt-5.5"],
+  "reviewModel": "openai-codex/gpt-6-astra",
+  "ideaModels": ["openai-codex/gpt-6-astra", "openai-codex/gpt-6-astra", "openai-codex/gpt-6-astra"],
   "validationMetrics": [
     { "name": "validation_ms", "direction": "lower", "maxRegressionPercent": 2 }
   ],
@@ -34,7 +34,7 @@ Use explicit reasoning model IDs available in your Pi installation. The reviewer
 }
 ```
 
-Replace the file paths and models with your own. `sourceFiles` contains the production source the agent may change and all source needed for review. Changes to other production files block the experiment. `evaluationFiles` contains helper scripts and data used by measurement or validation. Include every such dependency: freezing a shell wrapper does not freeze a helper it imports. Evaluation files must not overlap production source files.
+Replace the file paths with your own. Repeated Astra entries create independent ideation requests with different roles; configure one to three entries. `sourceFiles` contains the production source the agent may change and all source needed for review. Changes to other production files block the experiment. `evaluationFiles` contains helper scripts and data used by measurement or validation. Include every such dependency: freezing a shell wrapper does not freeze a helper it imports. Evaluation files must not overlap production source files.
 
 Run the benchmark as `bash .auto/measure.sh`. Independent mode executes this script directly and rejects arguments, environment prefixes, pipes, redirection, and chained commands.
 
@@ -79,7 +79,7 @@ bun examples/independent-research/validate.ts
 
 It checks a correct baseline, fresh intelligent ideation, a benchmark shortcut that passes the limited holdout but fails independent review, a deterministic validation regression, metric spoofing, edits after measurement, and a general algorithm improvement that gets committed. It uses operation counts to make acceptance boundaries deterministic; those counts are not wall-clock speed measurements.
 
-Override models with `RESEARCH_EXPERIMENTER`, `RESEARCH_REVIEWER`, and the comma-separated `RESEARCH_IDEA_MODELS`. The live example uses the installed current Pi SDK. Automated tests use temporary Git repositories and deterministic model responses for failure cases.
+Override the executing model with `RESEARCH_EXPERIMENTER`. The reviewer and all three ideation agents use Astra. The live example uses the installed current Pi SDK. Automated tests use temporary Git repositories and deterministic model responses for failure cases.
 
 For a complete interactive agent loop, run `bun examples/independent-research/validate.ts --prepare-agent`. Start Pi in the printed directory with this extension loaded, then run `/autoresearch optimize generic duplicate counting`. Pi establishes the baseline, chooses an independently generated idea, implements it, and requests acceptance. The two-experiment limit lets it report the final result without an abort error.
 

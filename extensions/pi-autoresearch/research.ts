@@ -30,9 +30,11 @@ export type Exec = (command: string, args: string[], options: {
   cwd: string; timeout: number; signal?: AbortSignal;
 }) => Promise<{ code: number; stdout: string; stderr: string; killed?: boolean }>;
 export type ModelCall = (model: string, system: string, data: unknown, signal?: AbortSignal) => Promise<string>;
+export const CONSULTANT_MODEL = "openai-codex/gpt-6-astra";
 
 export function researchModelCall(ctx: ExtensionContext): ModelCall {
   return async (id, system, data, signal) => {
+    if (id !== CONSULTANT_MODEL) throw new Error(`External consultants must use ${CONSULTANT_MODEL}`);
     const slash = id.indexOf("/");
     const model = ctx.modelRegistry.find(id.slice(0, slash), id.slice(slash + 1));
     if (!model || !model.reasoning) throw new Error(`A reasoning model is required: ${id}`);

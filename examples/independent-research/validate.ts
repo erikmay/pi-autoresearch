@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import autoresearchExtension from "../../extensions/pi-autoresearch/index.ts";
+import { CONSULTANT_MODEL } from "../../extensions/pi-autoresearch/research.ts";
 
 const executable = Bun.which("pi");
 if (!executable) throw new Error("Install and authenticate Pi before running this example.");
@@ -15,8 +16,8 @@ while (path.basename(sdkDirectory) !== "dist" && path.dirname(sdkDirectory) !== 
 const sdk = await import(pathToFileURL(path.join(sdkDirectory, "index.js")).href);
 const registry = new sdk.ModelRegistry(await sdk.ModelRuntime.create());
 const experimenterId = process.env.RESEARCH_EXPERIMENTER ?? "openai-codex/gpt-5.6-sol";
-const reviewerId = process.env.RESEARCH_REVIEWER ?? "openai-codex/gpt-5.5";
-const ideaIds = (process.env.RESEARCH_IDEA_MODELS ?? "openai-codex/gpt-6-astra,openai-codex/gpt-5.5").split(",");
+const reviewerId = CONSULTANT_MODEL;
+const ideaIds = [CONSULTANT_MODEL, CONSULTANT_MODEL, CONSULTANT_MODEL];
 function resolve(id: string) {
   const slash = id.indexOf("/");
   const model = registry.find(id.slice(0, slash), id.slice(slash + 1));

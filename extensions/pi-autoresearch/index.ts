@@ -53,7 +53,7 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts, SHORTCUT_ACTIONS } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
-import { ResearchSession, researchModelCall, type Snapshot } from "./research.ts";
+import { CONSULTANT_MODEL, ResearchSession, researchModelCall, type Snapshot } from "./research.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -1096,6 +1096,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const workDir = resolveWorkDir(ctx.cwd);
     if (!runtime.research && !fs.existsSync(path.join(workDir, ".auto/research.json"))) return undefined;
     const research = runtime.research ?? new ResearchSession(workDir, (command, args, options) => pi.exec(command, args, options));
+    if ([research.config.reviewModel, ...research.config.ideaModels].some((model) => model !== CONSULTANT_MODEL)) {
+      throw new Error(`External consultants must use ${CONSULTANT_MODEL}`);
+    }
     if (research.cwd !== workDir) throw new Error("Research working directory changed during the session");
     if (ctx.model && research.config.reviewModel === `${ctx.model.provider}/${ctx.model.id}`) {
       throw new Error("reviewModel must differ from the experimenter model");

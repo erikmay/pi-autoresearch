@@ -2,6 +2,12 @@
 
 Validated locally on 2026-09-17 with Pi 0.85.1 and Herdr. The implementation branch is `feat/independent-research`.
 
+## Consultant policy update
+
+Following the user's model-selection instruction, future evaluation and ideation requests use only `openai-codex/gpt-6-astra`. The example now runs three separate Astra ideation requests with different roles. Other external consultant IDs are blocked before API requests. The integration checks require all consultant calls to use Astra.
+
+The real model results below record the earlier mixed-model validation. They remain historical evidence; they do not claim a new complete Astra-only live run.
+
 ## Automated checks
 
 `pnpm test` passed all 101 tests. The suite includes real temporary Git repositories and actual Bash measurements. Deterministic model responses exercise acceptance, rejection, malformed responses, provider errors, cancellation, and deadlines.
