@@ -4,9 +4,11 @@ Validated locally on 2026-09-17 with Pi 0.85.1 and Herdr. The implementation bra
 
 ## Automated checks
 
-`pnpm test` passed all 99 tests. The suite includes real temporary Git repositories and actual Bash measurements. Deterministic model responses exercise acceptance, rejection, malformed responses, provider errors, cancellation, and deadlines.
+`pnpm test` passed all 101 tests. The suite includes real temporary Git repositories and actual Bash measurements. Deterministic model responses exercise acceptance, rejection, malformed responses, provider errors, cancellation, and deadlines.
 
 The acceptance checks cover missing/consumed evidence, primary metric spoofing, code changes after measurement, shell chaining, changes to frozen scripts and helpers, holdout regressions, cumulative tolerance drift, outstanding required validation, failed commits, staged candidate restoration, target reinitialization, and graceful completion at the iteration limit.
+
+The final fingerprint check also covers new production files and permission changes. Fingerprints use source contents, permissions, HEAD, changed paths, and evaluation source. Staging a new file may change the textual diff but must not invalidate an otherwise unchanged measured candidate.
 
 Fresh-request checks verify one user message, no experimenter hypotheses or descriptions, no historical backlog during generation, successful proposals when another agent fails, and evaluation-source visibility only for the reviewer.
 

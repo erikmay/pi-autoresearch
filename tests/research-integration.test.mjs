@@ -15,7 +15,7 @@ function exec(command, args, options) {
   });
 }
 
-async function harness(t, maxIterations = 10) {
+async function harness(t, maxIterations = 10, extraSources = []) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-research-integration-"));
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   fs.mkdirSync(path.join(cwd, ".auto"));
@@ -25,7 +25,7 @@ async function harness(t, maxIterations = 10) {
   write(".auto/measure.sh", '. ./source.sh\nprintf "METRIC time=%s\\n" "$PRIMARY"\n');
   write(".auto/holdout.sh", '. ./source.sh\nprintf "METRIC validation=%s\\n" "$HOLDOUT"\n');
   write(".auto/config.json", JSON.stringify({ maxIterations }));
-  write(".auto/research.json", JSON.stringify({ objective: "Improve generic execution time.", sourceFiles: ["source.sh"], reviewModel: "fake/reviewer", ideaModels: ["fake/ideas"], validationMetrics: [{ name: "validation", direction: "lower" }], repetitions: 1 }));
+  write(".auto/research.json", JSON.stringify({ objective: "Improve generic execution time.", sourceFiles: ["source.sh", ...extraSources], reviewModel: "fake/reviewer", ideaModels: ["fake/ideas"], validationMetrics: [{ name: "validation", direction: "lower" }], repetitions: 1 }));
   for (const args of [["init", "-q"], ["config", "user.email", "test@example.invalid"], ["config", "user.name", "Research Test"], ["add", "."], ["commit", "-qm", "Baseline"]]) {
     assert.equal((await exec("git", args, { cwd })).code, 0);
   }
@@ -173,4 +173,22 @@ test("iteration limit returns the accepted result and disables tools without abo
   assert.match(result.content[0].text, /Maximum experiments reached/);
   assert.equal(f.abortCount(), 0);
   assert.equal(f.activeTools().includes("run_experiment"), false);
+});
+
+test("approved new source files can be staged and committed without invalidating measured code", async (t) => {
+  const f = await harness(t, 10, ["extra.sh"]);
+  await f.run(); await f.log(100);
+  f.write("extra.sh", "PRIMARY=50\n");
+  f.write("source.sh", ". ./extra.sh\nHOLDOUT=50\n");
+  await f.run();
+  const result = await f.log(50);
+  assert.equal(result.details.experiment.status, "keep");
+  assert.equal((await exec("git", ["show", "HEAD:extra.sh"], { cwd: f.cwd })).stdout, "PRIMARY=50\n");
+});
+
+test("source permission changes after measurement invalidate acceptance", async (t) => {
+  const f = await harness(t);
+  await f.run();
+  fs.chmodSync(path.join(f.cwd, "source.sh"), 0o755);
+  assert.equal((await f.log(100)).isError, true);
 });

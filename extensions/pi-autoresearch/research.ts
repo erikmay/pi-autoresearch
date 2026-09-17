@@ -126,6 +126,7 @@ function readConfig(file: string): ResearchConfig {
 export interface Snapshot {
   head: string;
   files: Record<string, string | null>;
+  fileModes: Record<string, number | null>;
   diff: string;
   changedFiles: string[];
   evaluationSource: Record<string, string>;
@@ -245,27 +246,30 @@ export class ResearchSession {
     const head = (await this.git(["rev-parse", "HEAD"], signal)).trim();
     const changed = (await this.git(["diff", "HEAD", "--name-only", "-z"], signal)).split("\0").filter(Boolean);
     const untracked = (await this.git(["ls-files", "--others", "--exclude-standard", "-z"], signal)).split("\0").filter(Boolean);
-    const changedFiles = [...new Set([...changed, ...untracked])].filter((f) => !f.startsWith(".auto/") && !f.startsWith("autoresearch."));
+    const changedFiles = [...new Set([...changed, ...untracked])].filter((f) => !f.startsWith(".auto/") && !f.startsWith("autoresearch.")).sort();
     const outside = changedFiles.filter((f) => !this.config.sourceFiles.includes(f));
     if (outside.length) throw new Error(`Changes outside research sourceFiles: ${outside.join(", ")}`);
     const files: Record<string, string | null> = Object.create(null);
+    const fileModes: Record<string, number | null> = Object.create(null);
     for (const name of this.config.sourceFiles) {
       const file = path.resolve(this.cwd, name);
-      if (!fs.existsSync(file)) { files[name] = null; continue; }
+      if (!fs.existsSync(file)) { files[name] = null; fileModes[name] = null; continue; }
       const real = fs.realpathSync(file);
       if (!real.startsWith(fs.realpathSync(this.cwd) + path.sep) || fs.lstatSync(file).isSymbolicLink() || !fs.statSync(file).isFile()) throw new Error(`Invalid source file: ${name}`);
       const data = fs.readFileSync(file);
       if (data.includes(0)) throw new Error(`Binary source snapshot is unsupported: ${name}`);
       files[name] = data.toString("utf8");
+      fileModes[name] = fs.statSync(file).mode & 0o777;
     }
     const diff = await this.git(["diff", "HEAD", "--", ...this.config.sourceFiles], signal);
     const evaluationSource: Record<string, string> = Object.create(null);
     for (const file of [sessionFilePath(this.cwd, "measure"), sessionFilePath(this.cwd, "checks"), path.join(this.cwd, ".auto/holdout.sh"), ...this.config.evaluationFiles.map((f) => path.join(this.cwd, f))]) {
       if (fs.existsSync(file)) evaluationSource[path.relative(this.cwd, file)] = fs.readFileSync(file, "utf8");
     }
-    const payload = JSON.stringify({ head, files, diff, changedFiles, evaluationSource });
-    if (Buffer.byteLength(payload) > MAX_SNAPSHOT_BYTES) throw new Error("Source snapshot exceeds 200 KiB; narrow sourceFiles explicitly");
-    return { head, files, diff, changedFiles, evaluationSource, fingerprint: hash(payload) };
+    const payload = JSON.stringify({ head, files, fileModes, changedFiles, evaluationSource });
+    if (Buffer.byteLength(payload) + Buffer.byteLength(diff) > MAX_SNAPSHOT_BYTES) throw new Error("Source snapshot exceeds 200 KiB; narrow sourceFiles explicitly");
+    // Staging a new file changes the diff representation, but not the measured source.
+    return { head, files, fileModes, diff, changedFiles, evaluationSource, fingerprint: hash(payload) };
   }
 
   async begin(signal?: AbortSignal): Promise<Snapshot> {
