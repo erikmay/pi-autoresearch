@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The outside advisor also receives changed code since the baseline, the coverage inventory, and measurement/check scripts. Optional `contextFiles` adds project evidence. Advice distinguishes claimed coverage from verified agent functionality.
+
 ### Added
 
 - Optional outside research advisor configured through `.auto/research.json`. The advisor receives current source and captured experiment outcomes, including secondary costs, and can suggest useful directions or stop the loop. `/autoresearch ideas` requests advice on demand.

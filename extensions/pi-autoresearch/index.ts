@@ -2653,7 +2653,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const measured = r.asi?.advisor_result;
       return {
         approach: measured?.approach ?? (typeof r.asi?.approach === "string" ? r.asi.approach : "unspecified"),
-        status: r.status, metric: measured ? measured.metric : null,
+        commit: r.commit, status: r.status, metric: measured ? measured.metric : null,
         metrics: measured?.metrics ?? {},
         checksPassed: measured?.checksPassed ?? null,
         ...(measured?.failure ? { failure: measured.failure } : {}),

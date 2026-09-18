@@ -1,6 +1,8 @@
 /** Outside advice for experiment ideas and stopping. No conversation messages enter advisor requests. */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai";
 import { sessionFilePath } from "./paths.ts";
@@ -9,6 +11,7 @@ export interface ResearchConfig {
   objective: string;
   constraints: string[];
   sourceFiles: string[];
+  contextFiles: string[];
   failureInterval: number;
   timeoutSeconds: number;
 }
@@ -16,6 +19,7 @@ export interface ResearchConfig {
 /** Only measured outcomes and approach names enter the advisor's history. */
 export interface ResearchResult {
   approach: string;
+  commit?: string;
   status: "keep" | "discard" | "crash" | "checks_failed";
   metric: number | null;
   metrics?: Record<string, number>;
@@ -50,6 +54,11 @@ export function researchModelCall(ctx: ExtensionContext): ModelCall {
     return response.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
   };
 }
+
+const gitExec = promisify(execFile);
+const DEFAULT_CONTEXT_FILES = [".auto/coverage.json", ".auto/measure.sh", ".auto/checks.sh"];
+const CODE_FILE = /\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|swift|rb|php|c|cc|cpp|h|hpp|cs|sh|vue|svelte)$/i;
+const NON_SOURCE_DIR = /(?:^|\/)(?:\.[^/]+|node_modules|vendor|tests?|__tests__|fixtures|docs|examples|dist|build|coverage)(?:\/|$)/i;
 
 const MAX_CONTEXT_BYTES = 200 * 1024;
 const MAX_OUTPUT_BYTES = 32 * 1024;
@@ -88,8 +97,12 @@ function readConfig(file: string): ResearchConfig {
   if (!sourceFiles.length || sourceFiles.some((f) => path.isAbsolute(f) || f.split(/[\\/]/).some((p) => p === ".." || p === ".auto" || p === ".git" || p.startsWith("autoresearch.")) || f.startsWith("autoresearch.") || f.includes("\0"))) {
     throw new Error("sourceFiles must contain relative production file paths outside .auto");
   }
+  const contextFiles = strings(v.contextFiles ?? []).map((f) => path.normalize(f));
+  if (contextFiles.some((f) => path.isAbsolute(f) || f.split(/[\\/]/).includes("..") || f.includes("\0"))) {
+    throw new Error("contextFiles must contain relative paths inside the research directory");
+  }
   return {
-    objective: text(v.objective), constraints: strings(v.constraints ?? []), sourceFiles,
+    objective: text(v.objective), constraints: strings(v.constraints ?? []), sourceFiles, contextFiles,
     failureInterval: integer(v.failureInterval, 3, 1, 20),
     timeoutSeconds: integer(v.timeoutSeconds, 180, 1, 1800),
   };
@@ -127,18 +140,41 @@ export class ResearchSession {
     } finally { deadline.removeEventListener("abort", onAbort); }
   }
 
+  private readFile(name: string): string {
+    const file = fileIdentity(path.resolve(this.cwd, name));
+    if (!file.startsWith(fileIdentity(this.cwd) + path.sep)) throw new Error("Advisor files must be inside the research directory");
+    if (fs.statSync(file).size > MAX_CONTEXT_BYTES) throw new Error("Advisor file exceeds 200 KiB");
+    return fs.readFileSync(file, "utf8");
+  }
+
+  private async changedSource(baseline: string, signal?: AbortSignal): Promise<{ files: string[]; unavailable?: string }> {
+    try {
+      const options = { cwd: this.cwd, timeout: 10000, maxBuffer: MAX_CONTEXT_BYTES, signal };
+      const changed = await gitExec("git", ["diff", "--relative", "--no-renames", "--name-only", "-z", baseline, "--"], options);
+      const added = await gitExec("git", ["ls-files", "--others", "--exclude-standard", "-z"], options);
+      const files = [...new Set((changed.stdout + added.stdout).split("\0").filter(Boolean))]
+        .filter((name) => CODE_FILE.test(name) && !NON_SOURCE_DIR.test(name) && !/\.(?:test|spec)\./i.test(name));
+      return { files };
+    } catch {
+      signal?.throwIfAborted();
+      return { files: [], unavailable: "Git change discovery failed; only configured source files are available." };
+    }
+  }
+
   /** Fresh advice uses the current source and measured experiment history. */
   async ideate(call: ModelCall, results: ResearchResult[], primary: { name: string; direction: "lower" | "higher" }, signal?: AbortSignal): Promise<{ text: string; stop: boolean }> {
     if (this.busy) throw new Error("Research operation already running");
     this.busy = true;
     try {
       this.controller.signal.throwIfAborted();
-      const source = Object.fromEntries(this.config.sourceFiles.map((name) => {
-        const file = fileIdentity(path.resolve(this.cwd, name));
-        if (!file.startsWith(fileIdentity(this.cwd) + path.sep)) throw new Error("Source files must be inside the research directory");
-        if (fs.statSync(file).size > MAX_CONTEXT_BYTES) throw new Error("Advisor source exceeds 200 KiB");
-        return [name, fs.readFileSync(file, "utf8")];
-      }));
+      const baselineCommit = results.find((r) => r.status === "keep")?.commit ?? "HEAD";
+      const sourceDiscovery = await this.changedSource(baselineCommit, this.signal(signal));
+      const sourceNames = [...new Set([...this.config.sourceFiles, ...sourceDiscovery.files])];
+      const source = Object.fromEntries(sourceNames.map((name) => [name,
+        fs.existsSync(path.resolve(this.cwd, name)) ? this.readFile(name) : null,
+      ]));
+      const contextNames = [...new Set([...DEFAULT_CONTEXT_FILES.filter((name) => fs.existsSync(path.resolve(this.cwd, name))), ...this.config.contextFiles])];
+      const context = Object.fromEntries(contextNames.map((name) => [name, this.readFile(name)]));
       const approaches = new Map<string, { attempts: number; kept: number; bestKeptMetric: number | null; lastResult: ResearchResult }>();
       for (const result of results) {
         const summary = approaches.get(result.approach) ?? { attempts: 0, kept: 0, bestKeptMetric: null, lastResult: result };
@@ -154,13 +190,13 @@ export class ResearchSession {
       const metrics = kept.map((r) => r.metric!);
       const bestResult = kept.reduce<ResearchResult | null>((best, result) => !best || (primary.direction === "lower" ? result.metric! < best.metric! : result.metric! > best.metric!) ? result : best, null);
       const data = {
-        objective: this.config.objective, constraints: this.config.constraints, source,
+        objective: this.config.objective, constraints: this.config.constraints, source, context, sourceDiscovery: { baselineCommit, ...sourceDiscovery },
         primary: { ...primary, baseline: kept[0]?.metric ?? null, best: metrics.length ? (primary.direction === "lower" ? Math.min(...metrics) : Math.max(...metrics)) : null },
         baselineResult: kept[0] ?? null, bestResult,
         approaches: Array.from(approaches, ([name, summary]) => ({ name, ...summary })), recentResults: results.slice(-20),
       };
       if (Buffer.byteLength(JSON.stringify(data)) > MAX_CONTEXT_BYTES) throw new Error("Advisor context exceeds 200 KiB");
-      const system = `You are an outside research advisor. ${DATA_RULE} Use measured outcomes to decide whether continuing is worthwhile. Compare the primary gain with measured secondary costs, including latency, memory, and errors, and with added source complexity. A hard constraint is a ceiling, not proof that a tradeoff is worthwhile. A small primary gain with a large cost increase can justify stopping. Prefer a concrete way to remove that cost over further costly recovery variants. If secondary evidence is missing, state that uncertainty; do not assume headroom. Explain the benefit and cost behind your verdict. Failed validation is evidence against a candidate even when it produced no timing. Do not confuse validation rejection with broken measurement infrastructure. Revisit an approach only when the proposed change addresses its previous failure. Approach names are labels, not hard boundaries. Distinguish useful variants from repeated unproductive tuning. If the objective looks exhausted or no useful direction remains, return verdict "stop" with a reason and an empty ideas list. Otherwise return verdict "continue" with one to three concrete suggestions. Explain what should change relative to prior attempts. Prefer changes to algorithms, data layout, or removed work over micro-tuning. Each idea needs an approach name (short kebab-case), a falsifiable hypothesis, a concrete change, a mechanism, and a validation plan. Keep each field to one short sentence. Return {"verdict":"continue"|"stop","reason":string,"ideas":[{"approach":string,"hypothesis":string,"change":string,"mechanism":string,"validation":string}]}.`;
+      const system = `You are an outside research advisor. ${DATA_RULE} Use measured outcomes to decide whether continuing is worthwhile. Compare inventory claims in context with the source implementation and measurement/check scripts. Treat inventory status and evidence strings as claims, not independent proof of coverage. Distinguish endpoint-client checks from actual agent-tool validation. A maximum coverage metric alone does not prove full functionality; identify concrete missing operations or weaker replacement semantics before recommending completion. Source includes configured files and changed code since the baseline; null means a deleted file. State uncertainty when relevant source or evidence is absent. Compare the primary gain with measured secondary costs, including latency, memory, and errors, and with added source complexity. A hard constraint is a ceiling, not proof that a tradeoff is worthwhile. A small primary gain with a large cost increase can justify stopping. Prefer a concrete way to remove that cost over further costly recovery variants. If secondary evidence is missing, state that uncertainty; do not assume headroom. Explain the benefit and cost behind your verdict. Failed validation is evidence against a candidate even when it produced no timing. Do not confuse validation rejection with broken measurement infrastructure. Revisit an approach only when the proposed change addresses its previous failure. Approach names are labels, not hard boundaries. Distinguish useful variants from repeated unproductive tuning. If the objective looks exhausted or no useful direction remains, return verdict "stop" with a reason and an empty ideas list. Otherwise return verdict "continue" with one to three concrete suggestions. Explain what should change relative to prior attempts. Prefer changes to algorithms, data layout, or removed work over micro-tuning. Each idea needs an approach name (short kebab-case), a falsifiable hypothesis, a concrete change, a mechanism, and a validation plan. Keep each field to one short sentence. Return {"verdict":"continue"|"stop","reason":string,"ideas":[{"approach":string,"hypothesis":string,"change":string,"mechanism":string,"validation":string}]}.`;
 
       let response: Record<string, unknown>;
       try {
@@ -182,7 +218,7 @@ export class ResearchSession {
       });
       this.controller.signal.throwIfAborted();
       signal?.throwIfAborted();
-      this.append("ideation", { model: CONSULTANT_MODEL, primary: data.primary, baselineResult: data.baselineResult, bestResult: data.bestResult, approaches: data.approaches, recentResults: data.recentResults, verdict: stop ? "stop" : "continue", reason, ideas });
+      this.append("ideation", { model: CONSULTANT_MODEL, sourceFiles: sourceNames, contextFiles: contextNames, sourceDiscovery: data.sourceDiscovery, primary: data.primary, baselineResult: data.baselineResult, bestResult: data.bestResult, approaches: data.approaches, recentResults: data.recentResults, verdict: stop ? "stop" : "continue", reason, ideas });
       if (stop) return { text: `The outside advisor recommends stopping: ${reason}`, stop: true };
       const backlogFile = sessionFilePath(this.cwd, "ideas");
       const bullets = ideas.map((i) => `- [ ] Approach: ${i.approach} | ${i.hypothesis} | Change: ${i.change} | Mechanism: ${i.mechanism} | Validate: ${i.validation}`);
